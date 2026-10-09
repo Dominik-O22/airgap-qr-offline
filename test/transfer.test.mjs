@@ -1,40 +1,36 @@
 // End-to-end and adversarial tests for the QR file transfer protocol.
 //
 // The generator page (offline/generator.html) is driven through DOM stubs:
-// pasting text / picking a file and clicking Start, then reading the QR
-// payloads it renders. Those payloads (or hand-crafted malicious ones) are
+// pasting text / picking a file and clicking Start, then reading the bytes of
+// each QR code it draws. Those payloads (or hand-crafted malicious ones) are
 // fed to the scanner page (offline/scanner.html) through a stubbed jsQR,
 // simulating camera frames, and the resulting download is inspected.
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { gzipSync } from "node:zlib";
 import { randomBytes } from "node:crypto";
+import { gzipSync } from "node:zlib";
 
-import { loadGenerator, loadScanner, encodeChunk, senderFrames } from "./helpers.mjs";
+import { loadGenerator, loadScanner, frame, readHeader, blobFor, chunkFrames,
+         HEADER, SMALL_CODE } from "./helpers.mjs";
 
-const MAX_CHUNKS = 200000; // mirrors scanner MAX_CHUNKS
-const MAX_SIZE = 64 * 1024 * 1024; // mirrors scanner MAX_SIZE
+const MAX_CHUNKS = 200000; // mirrors codec MAX_CHUNKS
+const MAX_SIZE = 64 * 1024 * 1024; // mirrors codec MAX_SIZE
 
-// Drive a generator page to completion and return the rendered QR frames.
-async function framesForText(page, text) {
-  page.el("speed").value = "250";
-  page.el("text_input").value = text;
-  page.click("btn_start");
-  const meta = JSON.parse(page.frames[0]);
-  page.pumpTimers(meta.chunks); // render the remaining chunk frames
-  return page.frames;
-}
+const fakeFile = (name, bytes) => ({
+  name,
+  arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+});
 
-async function framesForFile(page, name, bytes) {
-  page.el("speed").value = "250";
-  page.el("file_input").files = [
-    { name, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) },
-  ];
+// Start a generator on pasted text or a file and return the first `count`
+// QR payloads it shows (default: one full pass over the chunks).
+async function send(page, { text, file }, count) {
+  if (text !== undefined) page.el("text_input").value = text;
+  if (file) page.el("file_input").files = [file];
   page.click("btn_start");
   await new Promise((r) => setImmediate(r)); // let arrayBuffer() resolve
-  const meta = JSON.parse(page.frames[0]);
-  page.pumpTimers(meta.chunks);
+  if (!page.frames.length) return page.frames;
+  page.pumpTimers((count ?? readHeader(page.frames[0]).chunks) - 1);
   return page.frames;
 }
 
@@ -47,35 +43,34 @@ async function receive(page, frames) {
 }
 
 describe("generator", () => {
-  it("emits a JSON metadata frame plus index,base64 chunk frames", async () => {
-    const text = "hello transfer " + randomBytes(512).toString("hex");
+  it("emits every chunk in order, then repair frames, all with one header", async () => {
     const page = loadGenerator();
-    const frames = await framesForText(page, text);
-    const meta = JSON.parse(frames[0]);
-    assert.equal(frames.length, meta.chunks + 1);
-    assert.equal(typeof meta.name, "string");
-    assert.ok(Number.isInteger(meta.chunks) && meta.chunks >= 2);
-    assert.equal(meta.size, new TextEncoder().encode(text).length);
-    for (const f of frames.slice(1)) {
-      assert.match(f, /^\d+,([A-Za-z0-9+/]+=*)$/);
-    }
+    const frames = await send(page, { file: fakeFile("a.bin", randomBytes(2000)) }, 40);
+    const first = readHeader(frames[0]);
+    assert.ok(first.chunks >= 4);
+    assert.equal(first.chunkSize, SMALL_CODE - HEADER);
+    frames.forEach((f, n) => {
+      const h = readHeader(f);
+      assert.equal(f.length, HEADER + first.chunkSize);
+      assert.deepEqual([h.size, h.chunkSize], [first.size, first.chunkSize]);
+      if (n < first.chunks) assert.equal(h.frameId, n);
+    });
+    assert.ok(readHeader(frames[first.chunks]).frameId >= first.chunks);
   });
 
   it("names pastes 'Paste @ <timestamp>'", async () => {
-    const page = loadGenerator();
-    const frames = await framesForText(page, "hi");
-    assert.match(JSON.parse(frames[0]).name, /^Paste @ \d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/);
+    const frames = await send(loadGenerator(), { text: "hi" });
+    const dl = await receive(loadScanner(), frames);
+    assert.match(dl[0].name, /^Paste @ \d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/);
   });
 
   it("prefers pasted text over a selected file", async () => {
-    const page = loadGenerator();
-    page.el("speed").value = "250";
-    page.el("text_input").value = "pasted text";
-    page.el("file_input").files = [
-      { name: "ignored.bin", arrayBuffer: async () => new ArrayBuffer(4) },
-    ];
-    page.click("btn_start");
-    assert.match(JSON.parse(page.frames[0]).name, /^Paste @ /);
+    const frames = await send(loadGenerator(), {
+      text: "pasted text",
+      file: fakeFile("ignored.bin", new Uint8Array(4)),
+    });
+    const dl = await receive(loadScanner(), frames);
+    assert.match(dl[0].name, /^Paste @ /);
   });
 
   it("does nothing without input", () => {
@@ -112,9 +107,9 @@ describe("generator", () => {
   });
 
   it("strips path components from the sent filename", async () => {
-    const page = loadGenerator();
-    const frames = await framesForFile(page, "../../pwned.txt", new Uint8Array([1, 2, 3]));
-    assert.equal(JSON.parse(frames[0]).name, "pwned.txt");
+    const frames = await send(loadGenerator(), { file: fakeFile("../../pwned.txt", new Uint8Array([1, 2, 3])) });
+    const dl = await receive(loadScanner(), frames);
+    assert.equal(dl[0].name, "pwned.txt");
   });
 });
 
@@ -122,26 +117,50 @@ describe("paste and file round-trips (generator -> scanner)", () => {
   it("round-trips a pasted text containing unicode", async () => {
     const text =
       "héllo wörld 🌍 — 中文\nline2\twith \"quotes\" 'and' apostrophes\n" + "y".repeat(600);
-    const page = loadGenerator();
-    const frames = await framesForText(page, text);
+    const frames = await send(loadGenerator(), { text });
     const dl = await receive(loadScanner(), frames);
     assert.equal(dl.length, 1);
-    assert.match(dl[0].name, /^Paste @ \d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/);
     assert.equal(new TextDecoder().decode(dl[0].data), text);
   });
 
   it("round-trips a multi-chunk binary file byte-for-byte", async () => {
-    const bytes = randomBytes(2048); // incompressible -> several 250-byte chunks
-    const gen = loadGenerator();
-    const frames = await framesForFile(gen, "report.bin", bytes);
-    const meta = JSON.parse(frames[0]);
-    assert.ok(meta.chunks >= 2);
+    const bytes = randomBytes(4096);
+    const frames = await send(loadGenerator(), { file: fakeFile("report.bin", bytes) });
+    assert.ok(frames.length >= 10);
     const scanner = loadScanner();
     const dl = await receive(scanner, frames);
     assert.equal(dl.length, 1);
     assert.equal(dl[0].name, "report.bin");
-    assert.ok(Buffer.from(dl[0].data).equals(Buffer.from(bytes)));
-    assert.equal(scanner.message, "Data Transfer Complete");
+    assert.ok(Buffer.from(dl[0].data).equals(bytes));
+    assert.equal(scanner.message, 'Received "report.bin"');
+  });
+
+  it("recovers lost chunks from repair frames", async () => {
+    const bytes = randomBytes(20000);
+    const gen = loadGenerator();
+    const all = await send(gen, { file: fakeFile("lossy.bin", bytes) }, 400);
+    const { chunks } = readHeader(all[0]);
+    // lose a third of everything, including the same chunks on the second pass
+    const kept = all.filter((f) => {
+      const id = readHeader(f).frameId;
+      return id < chunks ? id % 3 !== 0 : id % 7 !== 0;
+    });
+    const scanner = loadScanner();
+    const dl = await receive(scanner, kept);
+    assert.equal(dl.length, 1);
+    assert.ok(Buffer.from(dl[0].data).equals(bytes));
+  });
+
+  it("rebuilds a file from repair frames alone", async () => {
+    const bytes = randomBytes(6000);
+    const gen = loadGenerator();
+    const all = await send(gen, { file: fakeFile("late.bin", bytes) }, 600);
+    const { chunks } = readHeader(all[0]);
+    const repairs = all.filter((f) => readHeader(f).frameId >= chunks);
+    assert.ok(repairs.length > chunks + 10);
+    const dl = await receive(loadScanner(), repairs);
+    assert.equal(dl.length, 1);
+    assert.ok(Buffer.from(dl[0].data).equals(bytes));
   });
 });
 
@@ -151,108 +170,74 @@ describe("scanner robustness against malicious QR codes", () => {
     await page.startReceiver();
     return page;
   };
+  const feedEach = (page, payloads) => {
+    for (const p of payloads) {
+      page.feed(p);
+      page.pumpFrames(1);
+    }
+  };
 
-  it("ignores malformed metadata JSON", async () => {
+  it("ignores text codes and frames with invalid headers", async () => {
+    const data = Buffer.alloc(100);
     const page = await startScanner();
-    page.feed("{oops", '{"name"');
-    page.pumpFrames(2);
+    feedEach(page, [
+      "https://example.com",
+      '{"name":"a","chunks":1}',
+      frame({ size: 100, chunkSize: 100, data, magic: 0x00 }),
+      frame({ size: 0, chunkSize: 100, data }),
+      frame({ size: MAX_SIZE + 1, chunkSize: 100, data }),
+      frame({ size: 100, chunkSize: 0, data }),
+      frame({ size: 50, chunkSize: 100, data }), // chunk larger than the blob
+      frame({ size: 100, chunkSize: 100, data: Buffer.alloc(99) }), // truncated payload
+      frame({ size: 100, chunkSize: 100, data: Buffer.alloc(101) }), // trailing bytes
+      frame({ size: (MAX_CHUNKS + 1) * 100, chunkSize: 100, data }),
+      Buffer.alloc(HEADER, 0xa9), // header only
+    ]);
     assert.equal(page.progress, "Progress: 0 / 0");
     assert.equal(page.downloads.length, 0);
   });
 
-  it("rejects metadata with invalid fields", async () => {
-    const badMetas = [
-      '{"name":"a","chunks":0}',
-      '{"name":"a","chunks":1.5}',
-      `{"name":"a","chunks":${MAX_CHUNKS + 1}}`,
-      '{"name":"a","chunks":1,"size":-1}',
-      `{"name":"a","chunks":1,"size":${MAX_SIZE + 1}}`,
-      "[1,2]",
-      '{"chunks":1,"size":0}',
-      `{"name":"${"x".repeat(5001)}","chunks":1}`,
-    ];
+  it("fails loudly on a non-gzip blob and downloads nothing", async () => {
     const page = await startScanner();
-    for (const m of badMetas) {
-      page.feed(m);
-      page.pumpFrames(1);
-      assert.equal(page.progress, "Progress: 0 / 0", "rejected: " + m);
-    }
-    assert.equal(page.downloads.length, 0);
-  });
-
-  it("does not pollute Object.prototype via __proto__ in metadata", async () => {
-    const page = await startScanner();
-    page.feed('{"__proto__":{"polluted":1},"name":"x.bin","chunks":1,"size":0}');
-    page.pumpFrames(1);
-    assert.equal({}.polluted, undefined);
-    assert.equal(page.progress, "Progress: 0 / 1");
-  });
-
-  it("rejects out-of-range and malformed chunk indices", async () => {
-    const page = await startScanner();
-    page.feed('{"name":"a.bin","chunks":1,"size":0}');
-    page.pumpFrames(1);
-    const junk = ["-1," + btoa("junk"), "1," + btoa("junk"), "999999999," + btoa("junk"),
-                  "abc," + btoa("junk"), "," + btoa("junk"), "0nope", "0,,extra", "0,!!!not-base64!!!"];
-    for (const j of junk) {
-      page.feed(j);
-      page.pumpFrames(1);
-    }
-    assert.equal(page.progress, "Progress: 0 / 1");
-    assert.equal(page.downloads.length, 0);
-    // a legitimate chunk still completes the transfer afterwards
-    page.feed(encodeChunk(0, gzipSync(new Uint8Array(0))));
-    page.pumpFrames(1);
-    assert.equal(page.downloads.length, 1);
-    assert.equal(page.downloads[0].data.length, 0);
-  });
-
-  it("fails loudly on declared-size mismatch and downloads nothing", async () => {
-    const page = await startScanner();
-    page.feed('{"name":"x.bin","chunks":1,"size":9999}');
-    page.feed(encodeChunk(0, gzipSync(new TextEncoder().encode("hello")))); // inflates to 5 bytes
-    page.pumpFrames(2);
-    assert.equal(page.downloads.length, 0);
-    assert.match(page.message, /^Transfer failed: size mismatch/);
-  });
-
-  it("fails loudly on non-gzip payload and downloads nothing", async () => {
-    const page = await startScanner();
-    page.feed('{"name":"x.bin","chunks":1,"size":3}');
-    page.feed(encodeChunk(0, new TextEncoder().encode("abc"))); // raw bytes, not gzip
-    page.pumpFrames(2);
+    feedEach(page, [frame({ size: 40, chunkSize: 40, data: Buffer.alloc(40, 7) })]);
     assert.equal(page.downloads.length, 0);
     assert.match(page.message, /^Transfer failed/);
   });
 
-  it("resets collected chunks when new metadata arrives", async () => {
+  it("fails loudly when the blob's name length overruns its content", async () => {
+    const lying = Buffer.concat([Buffer.from([0xff, 0xff]), Buffer.from("abc")]);
     const page = await startScanner();
-    const frames = senderFrames("a.txt", randomBytes(900), { gzipSync }); // multi-chunk
-    page.feed(frames[0], frames[1]); // meta A + chunk 0
-    page.pumpFrames(2);
-    assert.equal(page.progress, "Progress: 1 / " + (frames.length - 1));
-    page.feed('{"name":"b.txt","chunks":1,"size":0}'); // a second sender's meta
-    page.pumpFrames(1);
-    assert.equal(page.progress, "Progress: 0 / 1");
+    feedEach(page, chunkFrames(gzipSync(lying)));
     assert.equal(page.downloads.length, 0);
+    assert.equal(page.message, "Transfer failed: bad file name length");
   });
 
-  it("keeps progress when the same metadata is re-scanned", async () => {
+  it("keeps progress when a stray frame of another transfer shows up", async () => {
     const page = await startScanner();
-    const frames = senderFrames("a.txt", randomBytes(900), { gzipSync }); // multi-chunk
-    page.feed(frames[0], frames[1], frames[0]); // meta, chunk 0, meta again
-    page.pumpFrames(3);
-    assert.equal(page.progress, "Progress: 1 / " + (frames.length - 1));
-    assert.equal(page.downloads.length, 0);
+    const a = chunkFrames(blobFor("a.bin", randomBytes(2000)));
+    const b = chunkFrames(blobFor("b.bin", randomBytes(2000)));
+    feedEach(page, [a[0], a[1], b[0], a[2], b[1], b[2]]);
+    assert.equal(page.progress, "Progress: 3 / " + a.length);
   });
 
-  it("never completes while chunks are missing", async () => {
+  it("switches to another transfer once it keeps showing up", async () => {
     const page = await startScanner();
-    const frames = senderFrames("a.txt", randomBytes(900), { gzipSync });
-    page.feed(frames[0], frames[1]); // 1 of >=4 chunks
-    page.pumpFrames(10);
+    const a = chunkFrames(blobFor("a.bin", randomBytes(2000)));
+    const b = chunkFrames(blobFor("b.bin", randomBytes(2000)));
+    feedEach(page, [a[0], a[1], b[0], b[1], b[2]]);
+    assert.equal(page.progress, "Progress: 1 / " + b.length); // b[2] started it
+    feedEach(page, b);
+    assert.equal(page.downloads.length, 1);
+    assert.equal(page.downloads[0].name, "b.bin");
+  });
+
+  it("never completes while chunks are missing, however often the rest repeat", async () => {
+    const page = await startScanner();
+    const frames = chunkFrames(blobFor("a.bin", randomBytes(2000)));
+    const partial = frames.slice(1);
+    feedEach(page, [...partial, ...partial, ...partial]);
     assert.equal(page.downloads.length, 0);
-    assert.equal(page.progress, "Progress: 1 / " + (frames.length - 1));
+    assert.equal(page.progress, `Progress: ${frames.length - 1} / ${frames.length}`);
   });
 
   it("downloads under a sanitized filename regardless of the claimed name", async () => {
@@ -267,26 +252,10 @@ describe("scanner robustness against malicious QR codes", () => {
     ];
     for (const [evil, expected] of cases) {
       const page = await startScanner();
-      page.feed(...senderFrames(evil, new Uint8Array([7, 7]), { gzipSync }));
-      page.pumpFrames(4);
+      feedEach(page, chunkFrames(blobFor(evil, new Uint8Array([7, 7]))));
       assert.equal(page.downloads.length, 1, "case: " + JSON.stringify(evil));
       assert.equal(page.downloads[0].name, expected);
-      assert.ok(!/[\\/]/.test(page.downloads[0].name));
-      assert.ok(!/[\u0000-\u001f\u007f]/.test(page.downloads[0].name));
+      assert.deepEqual(Array.from(page.downloads[0].data), [7, 7]);
     }
-  });
-
-  it("discards chunks scanned before the first valid metadata", async () => {
-    const page = await startScanner();
-    const frames = senderFrames("a.txt", new TextEncoder().encode("aaa"), { gzipSync });
-    page.feed(frames[1], frames[0]); // chunk first, then meta
-    page.pumpFrames(2);
-    assert.equal(page.progress, "Progress: 0 / 1"); // pre-meta chunks were wiped
-    assert.equal(page.downloads.length, 0);
-    // scanning the chunks again after the metadata completes the transfer
-    page.feed(...frames.slice(1));
-    page.pumpFrames(frames.length);
-    assert.equal(page.downloads.length, 1);
-    assert.equal(new TextDecoder().decode(page.downloads[0].data), "aaa");
   });
 });

@@ -15,7 +15,8 @@
       button { padding: 8px 16px; border: 2px solid #6b7280; background: #fff;
                cursor: pointer; font-size: 1rem; margin: 0 0 1rem; }
       button:hover { background: #e5e7eb; }
-      video { width: 100%; border: 1px solid #ddd; background: #000; }
+      video, canvas { width: 100%; border: 1px solid #ddd; background: #000; margin: 0 0 1rem; }
+      select { font-size: 1rem; margin: 0 0 1rem; max-width: 100%; }
     </style>
   </head>
   <body>
@@ -24,8 +25,11 @@
       <div class="message" id="user_message">Click receive button to start receiving</div>
       <div class="message" id="progress">Progress: 0 / 0</div>
       <button id="btn">Start Receiver</button>
+      <button id="btn_window">Capture a Window</button>
+      <select id="camera" hidden></select>
+      <div class="message" id="stats"></div>
+      <canvas id="scan"></canvas>
       <video id="video" muted autoplay playsinline></video>
-      <canvas id="scan" hidden></canvas>
     </div>
     <script>
 __PAKO__
@@ -34,31 +38,44 @@ __PAKO__
 __JSQR__
     </script>
     <script>
+__CODEC__
+    </script>
+    <script>
       (function () {
         var user_message = document.getElementById("user_message");
         var progress = document.getElementById("progress");
         var btn = document.getElementById("btn");
+        var btn_window = document.getElementById("btn_window");
         var video = document.getElementById("video");
         var scan = document.getElementById("scan");
+        var camera = document.getElementById("camera");
+        var stats = document.getElementById("stats");
 
-        var is_receiving = false, stream = null, meta = {}, decoded = {}, timer = null;
+        var is_receiving = false, stream = null, timer = null;
+        var can_capture_window = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
 
-        var decode_data = function (input_string) {
-          var encoded_data = atob(input_string.split(",")[1]);
-          var encoded_array = Array.from(encoded_data, function (char) {
-            return char.charCodeAt(0);
-          });
-          var output_string = new TextDecoder().decode(new Uint8Array(encoded_array));
-          return {
-            index: parseInt(input_string.split(",")[0], 10),
-            data: Array.from(output_string, function (char) {
-              return char.charCodeAt(0);
-            })
-          };
-        };
+        // The transfer being collected, and the last frame id seen (each code
+        // usually shows up in more than one camera frame).
+        var decoder = null, last_frame = -1;
+        // A frame from a different transfer only replaces the current one
+        // after this many arrive in a row, so one stray code cannot wipe it.
+        var SWITCH_AFTER = 3;
+        var rival_key = "", rival_count = 0;
 
-        var MAX_CHUNKS = 200000;
-        var MAX_SIZE = 64 * 1024 * 1024;
+        // Region of the video frame holding the QR code, in video pixels. Set
+        // once a code is found so later frames decode only that region,
+        // enlarged; null means the whole frame is searched.
+        var roi = null, roi_misses = 0, searches = 0;
+        var ROI_MARGIN_MODULES = 6; // padding around the code: its quiet zone and then some,
+        var ROI_MARGIN = 0.05;      // plus this fraction of its size as room to move
+        var ROI_MODULE_PX = 5;      // the region is scaled to this many pixels per QR module
+        var ROI_MAX_ZOOM = 4;
+        var ROI_MIN_ZOOM = 0.25;
+        var ROI_MAX_MISSES = 8;     // unreadable frames before searching the whole frame again
+        // Whole-frame searches alternate between these scales, since a dense
+        // code can be too fine to read (and so to locate) at camera resolution.
+        var SEARCH_ZOOMS = [1, 2];
+        var SEARCH_MAX_WIDTH = 2560;
 
         var safe_filename = function (name) {
           var n = String(name || "").split(/[\\/]/).pop();
@@ -66,16 +83,6 @@ __JSQR__
           if (n === "." || n === "..") n = "";
           if (n.length > 200) n = n.slice(0, 200);
           return n || "received_file.bin";
-        };
-
-        var valid_meta = function (m) {
-          if (!m || typeof m !== "object" || Array.isArray(m)) return false;
-          if (typeof m.name !== "string" || m.name.length > 5000) return false;
-          if (!Number.isInteger(m.chunks) || m.chunks < 1 || m.chunks > MAX_CHUNKS) return false;
-          if (m.size !== undefined && m.size !== null) {
-            if (!Number.isInteger(m.size) || m.size < 0 || m.size > MAX_SIZE) return false;
-          }
-          return true;
         };
 
         var download_file = function (data, fileName) {
@@ -89,80 +96,130 @@ __JSQR__
         };
 
         var render = function () {
-          var got = Object.keys(decoded).length;
-          var total = meta.chunks || 0;
-          progress.textContent = "Progress: " + got + " / " + total;
-          user_message.textContent = meta.name
-            ? ("Transferring file: " + meta.name)
-            : "Click receive button to start receiving";
+          progress.textContent = "Progress: " + (decoder ? decoder.rank() : 0) +
+            " / " + (decoder ? decoder.chunks : 0);
+          user_message.textContent = decoder
+            ? "Receiving " + Math.ceil(decoder.size / 1024) + " KB"
+            : is_receiving ? "Looking for a QR code"
+                           : "Click receive button to start receiving";
           btn.textContent = is_receiving ? "Stop Receiver" : "Start Receiver";
+          btn_window.hidden = is_receiving || !can_capture_window;
         };
 
-        var complete = function () {
-          var failed = null;
-          try {
-            var out = [];
-            for (var i = 0; i < meta.chunks; i++) {
-              out = out.concat(decoded[i]);
-            }
-            var unit8 = new Uint8Array(out);
-            var inflated = pako.inflate(unit8);
-            if (meta.size !== undefined && inflated.length !== meta.size) {
-              throw new Error("size mismatch: expected " + meta.size + " bytes, got " + inflated.length);
-            }
-            download_file(inflated, safe_filename(meta.name));
-          } catch (e) {
-            failed = e;
-          }
-          cancelAnimationFrame(timer);
-          is_receiving = false;
+        var next_frame = function () {
+          timer = video.requestVideoFrameCallback
+            ? video.requestVideoFrameCallback(scan_frame)
+            : requestAnimationFrame(scan_frame);
+        };
+
+        var stop_camera = function () {
+          if (video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(timer);
+          else cancelAnimationFrame(timer);
           if (stream) {
             stream.getTracks().forEach(function (t) { t.stop(); });
             stream = null;
           }
           video.srcObject = null;
-          meta = {};
-          decoded = {};
-          render();
+          camera.hidden = true;
+          roi = null;
+          stats.textContent = "";
+        };
+
+        // Square region around a decoded code's corners, mapped from scan
+        // canvas pixels back to video pixels and padded so the code stays
+        // inside it if the camera moves a little. `zoom` scales the region so
+        // each of the code's modules covers ROI_MODULE_PX pixels.
+        var region_around = function (code, src, zoom) {
+          var loc = code.location, modules = 17 + 4 * (code.version || 1);
+          var pts = [loc.topLeftCorner, loc.topRightCorner, loc.bottomLeftCorner, loc.bottomRightCorner];
+          var xs = pts.map(function (p) { return src.x + p.x / zoom; });
+          var ys = pts.map(function (p) { return src.y + p.y / zoom; });
+          var side = Math.max(Math.max.apply(null, xs) - Math.min.apply(null, xs),
+                              Math.max.apply(null, ys) - Math.min.apply(null, ys));
+          var pad = side * (ROI_MARGIN_MODULES / modules + ROI_MARGIN);
+          var x0 = Math.max(0, Math.floor(Math.min.apply(null, xs) - pad));
+          var y0 = Math.max(0, Math.floor(Math.min.apply(null, ys) - pad));
+          var x1 = Math.min(video.videoWidth, Math.ceil(Math.max.apply(null, xs) + pad));
+          var y1 = Math.min(video.videoHeight, Math.ceil(Math.max.apply(null, ys) + pad));
+          return { x: x0, y: y0, w: x1 - x0, h: y1 - y0,
+                   zoom: Math.min(ROI_MAX_ZOOM, Math.max(ROI_MIN_ZOOM, ROI_MODULE_PX * modules / side)) };
+        };
+
+        // Decodes the current video frame and returns the QR code's bytes, or
+        // null. With a tracked region only that part is decoded, scaled so
+        // small or dense codes still have several pixels per module.
+        var decode_frame = function () {
+          var src = roi || { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
+          var zoom = roi ? roi.zoom
+            : Math.min(SEARCH_ZOOMS[searches++ % SEARCH_ZOOMS.length], SEARCH_MAX_WIDTH / src.w);
+          scan.width = Math.round(src.w * zoom);
+          scan.height = Math.round(src.h * zoom);
+          var ctx = scan.getContext("2d", { willReadFrequently: true });
+          ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, scan.width, scan.height);
+          var image = ctx.getImageData(0, 0, scan.width, scan.height);
+          var started = Date.now();
+          var code = jsQR(image.data, scan.width, scan.height, { inversionAttempts: "dontInvert" });
+          stats.textContent = "Video " + video.videoWidth + "x" + video.videoHeight +
+            (roi ? ", tracking code at " : ", searching whole frame at ") + zoom.toFixed(1) + "x" +
+            ", decode " + (Date.now() - started) + "ms";
+          if (!code) {
+            if (roi && ++roi_misses >= ROI_MAX_MISSES) roi = null;
+            return null;
+          }
+          roi_misses = 0;
+          if (code.location) roi = region_around(code, src, zoom);
+          return code.binaryData;
+        };
+
+        var complete = function () {
+          var failed = null, name = "";
+          try {
+            var file = AirgapCodec.unpack(decoder.blob());
+            name = safe_filename(file.name);
+            download_file(file.bytes, name);
+          } catch (e) {
+            failed = e;
+          }
+          stop_receiving();
           user_message.textContent = failed
             ? "Transfer failed: " + (failed.message || String(failed))
-            : "Data Transfer Complete";
+            : "Received \"" + name + "\"";
+        };
+
+        // Feeds one decoded QR payload to the current transfer.
+        var accept = function (bytes) {
+          var f = AirgapCodec.parse(bytes);
+          if (!f) {
+            if (!decoder) {
+              user_message.textContent = "Found a QR code, but not one from this sender. " +
+                "If the sender page is an older version, reload it.";
+            }
+            return;
+          }
+          if (decoder && decoder.key !== f.key) {
+            rival_count = f.key === rival_key ? rival_count + 1 : 1;
+            rival_key = f.key;
+            if (rival_count < SWITCH_AFTER) return;
+            decoder = null;
+          }
+          rival_count = 0;
+          if (!decoder) {
+            decoder = AirgapCodec.decoder(f);
+            last_frame = -1;
+          }
+          if (f.frame === last_frame) return;
+          last_frame = f.frame;
+          decoder.add(f);
+          render();
         };
 
         var scan_frame = function () {
           if (!is_receiving) return;
           try {
             if (video.videoWidth > 0 && video.videoHeight > 0) {
-              var scale = Math.min(1, 640 / video.videoWidth);
-              scan.width = Math.round(video.videoWidth * scale);
-              scan.height = Math.round(video.videoHeight * scale);
-              var ctx = scan.getContext("2d", { willReadFrequently: true });
-              ctx.drawImage(video, 0, 0, scan.width, scan.height);
-              var image = ctx.getImageData(0, 0, scan.width, scan.height);
-              var code = jsQR(image.data, scan.width, scan.height);
-              if (code) {
-                var data = code.data;
-                if (data.charAt(0) === "{") {
-                  try {
-                    var m = JSON.parse(data);
-                    if (valid_meta(m) &&
-                        (m.name !== meta.name || m.chunks !== meta.chunks || m.size !== meta.size)) {
-                      meta = m;
-                      decoded = {};
-                    }
-                  } catch (e) { /* ignore malformed metadata */ }
-                } else if (data.split(",").length === 2) {
-                  try {
-                    var raw = decode_data(data);
-                    if (Number.isInteger(raw.index) && raw.index >= 0 &&
-                        (!meta.chunks || raw.index < meta.chunks)) {
-                      decoded[raw.index] = raw.data;
-                    }
-                  } catch (e) { /* ignore malformed chunk */ }
-                }
-                render();
-              }
-              if (meta.chunks && Object.keys(decoded).length >= meta.chunks) {
+              var bytes = decode_frame();
+              if (bytes) accept(bytes);
+              if (decoder && decoder.rank() >= decoder.chunks) {
                 complete();
                 return;
               }
@@ -170,48 +227,100 @@ __JSQR__
           } catch (e) {
             /* skip unreadable frame */
           }
-          timer = requestAnimationFrame(scan_frame);
+          next_frame();
         };
 
-        btn.addEventListener("click", function () {
-          if (is_receiving) {
-            is_receiving = false;
-            cancelAnimationFrame(timer);
-            if (stream) {
-              stream.getTracks().forEach(function (t) { t.stop(); });
-              stream = null;
-            }
-            video.srcObject = null;
-            meta = {};
-            decoded = {};
-            render();
-            return;
-          }
+        // Starts scanning a newly opened stream, replacing the current one.
+        var use_stream = function (s) {
+          if (!is_receiving) { s.getTracks().forEach(function (t) { t.stop(); }); return false; }
+          stop_camera();
+          stream = s;
+          video.srcObject = s;
+          scan_frame();
+          return true;
+        };
+
+        // Opens the chosen camera (or the rear-facing default) at the highest
+        // resolution it offers up to 1080p; browsers default to 640x480.
+        var open_camera = function (device_id) {
+          var want = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+          if (device_id) want.deviceId = { exact: device_id };
+          else want.facingMode = "environment";
+          return navigator.mediaDevices.getUserMedia({ video: want }).then(function (s) {
+            if (use_stream(s)) list_cameras();
+          });
+        };
+
+        // Scans a window or screen of this machine instead of a camera, e.g.
+        // a remote desktop client showing the sender. The browser asks which.
+        var open_window = function () {
+          return navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } })
+            .then(function (s) {
+              if (!use_stream(s)) return;
+              // sharing ended from the browser's own controls
+              s.getVideoTracks()[0].addEventListener("ended", function () {
+                if (stream === s) stop_receiving();
+              });
+            });
+        };
+
+        // Fills the camera picker. Labels are only available once camera
+        // permission has been granted, so this runs after a stream opens.
+        var list_cameras = function () {
+          if (!navigator.mediaDevices.enumerateDevices) return;
+          var track = stream.getVideoTracks()[0];
+          var current = track ? track.getSettings().deviceId : "";
+          navigator.mediaDevices.enumerateDevices().then(function (devices) {
+            var cams = devices.filter(function (d) { return d.kind === "videoinput"; });
+            camera.textContent = "";
+            cams.forEach(function (d, i) {
+              var opt = document.createElement("option");
+              opt.value = d.deviceId;
+              opt.textContent = d.label || "Camera " + (i + 1);
+              opt.selected = d.deviceId === current;
+              camera.appendChild(opt);
+            });
+            camera.hidden = cams.length < 2;
+          });
+        };
+
+        var source_failed = function (e) {
+          stop_receiving();
+          user_message.textContent = "Video error: " + e.message;
+        };
+
+        // Switching cameras mid-transfer keeps the chunks received so far.
+        camera.addEventListener("change", function () {
+          if (is_receiving) open_camera(camera.value).catch(source_failed);
+        });
+
+        var stop_receiving = function () {
+          is_receiving = false;
+          stop_camera();
+          decoder = null;
+          render();
+        };
+
+        // Begins a fresh transfer from the stream that `open` resolves to.
+        var start_receiving = function (open) {
           is_receiving = true;
-          decoded = {};
-          meta = {};
+          decoder = null;
           render();
           if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            is_receiving = false;
-            render();
+            stop_receiving();
             user_message.textContent =
               "Camera unavailable: this page must be opened from a secure context " +
               "(e.g. http://localhost) to access the camera.";
             return;
           }
-          navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-            .then(function (s) {
-              if (!is_receiving) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
-              stream = s;
-              video.srcObject = s;
-              scan_frame();
-            })
-            .catch(function (e) {
-              is_receiving = false;
-              user_message.textContent = "Camera error: " + e.message;
-              render();
-            });
+          open().catch(source_failed);
+        };
+
+        btn.addEventListener("click", function () {
+          if (is_receiving) stop_receiving();
+          else start_receiving(function () { return open_camera(camera.value); });
         });
+        btn_window.addEventListener("click", function () { start_receiving(open_window); });
 
         render();
       })();

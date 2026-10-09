@@ -15,7 +15,8 @@
       button { padding: 8px 16px; border: 2px solid #6b7280; background: #fff;
                cursor: pointer; font-size: 1rem; margin: 0 0 1rem; }
       button:hover { background: #e5e7eb; }
-      video { width: 100%; border: 1px solid #ddd; background: #000; }
+      video, canvas { width: 100%; border: 1px solid #ddd; background: #000; margin: 0 0 1rem; }
+      select { font-size: 1rem; margin: 0 0 1rem; max-width: 100%; }
     </style>
   </head>
   <body>
@@ -24,8 +25,11 @@
       <div class="message" id="user_message">Click receive button to start receiving</div>
       <div class="message" id="progress">Progress: 0 / 0</div>
       <button id="btn">Start Receiver</button>
+      <button id="btn_window">Capture a Window</button>
+      <select id="camera" hidden></select>
+      <div class="message" id="stats"></div>
+      <canvas id="scan"></canvas>
       <video id="video" muted autoplay playsinline></video>
-      <canvas id="scan" hidden></canvas>
     </div>
     <script>
 /*! pako 2.0.3 https://github.com/nodeca/pako @license (MIT AND Zlib) */
@@ -10137,31 +10141,257 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 });
     </script>
     <script>
+// Wire format and erasure code shared by the sender and the receiver.
+// Expects pako to be loaded first.
+//
+// A transfer is one blob: gzip([u16 name length][name, UTF-8][file bytes]).
+// The blob is cut into K chunks of C bytes (the last one zero padded) and
+// every QR code carries one binary frame, integers big-endian:
+//
+//   byte 0       magic 0xA9
+//   bytes 1-4    transfer id (the blob's gzip CRC32, so a re-send matches)
+//   bytes 5-8    blob length
+//   bytes 9-10   chunk size C
+//   bytes 11-14  frame id
+//   bytes 15..   C payload bytes
+//
+// Frames 0..K-1 carry chunk number <frame id>. Every later frame is a repair
+// frame: the XOR of a pseudo-random subset of chunks derived from its id.
+// The receiver solves for lost chunks by Gaussian elimination, so any K
+// linearly independent frames rebuild the blob, whichever ones were missed.
+var AirgapCodec = (function () {
+  var MAGIC = 0xa9;
+  var HEADER = 15;
+  var MAX_CHUNKS = 200000;
+  var MAX_SIZE = 64 * 1024 * 1024;
+  var MAX_NAME = 5000;
+  // A repair frame XORs about this many chunks (half of them for small
+  // transfers), which bounds the work per frame on both sides.
+  var REPAIR_DEGREE = 1024;
+  // Unsolved repair frames the receiver keeps. Past this it waits for plain
+  // chunks, which bounds memory and the cost of reducing each new frame.
+  var MAX_ROWS = 2048;
+
+  // Chunk numbers XORed into frame `id` of a k-chunk transfer (mulberry32
+  // seeded with the id, so both sides derive the same subset).
+  var sources = function (id, k) {
+    if (id < k) return [id];
+    var out = [];
+    var limit = Math.min(0.5, REPAIR_DEGREE / k) * 4294967296;
+    var a = id | 0;
+    for (var i = 0; i < k; i++) {
+      a = (a + 0x6d2b79f5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      if (((t ^ (t >>> 14)) >>> 0) < limit) out.push(i);
+    }
+    if (!out.length) out.push(id % k);
+    return out;
+  };
+
+  // dst ^= src[offset .. offset + dst.length), stopping at the end of src.
+  var xor = function (dst, src, offset) {
+    var n = Math.min(dst.length, src.length - offset);
+    for (var i = 0; i < n; i++) dst[i] ^= src[offset + i];
+  };
+
+  // Sender: builds the blob for a named file.
+  var pack = function (name, bytes) {
+    var name_bytes = new TextEncoder().encode(name);
+    var plain = new Uint8Array(2 + name_bytes.length + bytes.length);
+    new DataView(plain.buffer).setUint16(0, name_bytes.length);
+    plain.set(name_bytes, 2);
+    plain.set(bytes, 2 + name_bytes.length);
+    return pako.gzip(plain, { level: 9 });
+  };
+
+  // Receiver: reverses pack(). Throws on anything that is not a valid blob.
+  var unpack = function (blob) {
+    if (blob.length < 18) throw new Error("not a gzip stream");
+    // gzip ends with the uncompressed length; refuse oversized claims up front
+    var claimed = new DataView(blob.buffer, blob.byteOffset, blob.byteLength)
+      .getUint32(blob.length - 4, true);
+    if (claimed > MAX_SIZE + MAX_NAME + 2) throw new Error("file too large");
+    var plain = pako.inflate(blob);
+    if (plain.length < 2) throw new Error("missing file name");
+    var name_length = new DataView(plain.buffer, plain.byteOffset).getUint16(0);
+    if (name_length > MAX_NAME || 2 + name_length > plain.length) {
+      throw new Error("bad file name length");
+    }
+    return {
+      name: new TextDecoder().decode(plain.subarray(2, 2 + name_length)),
+      bytes: plain.subarray(2 + name_length)
+    };
+  };
+
+  // Sender: frame source for a blob, given how many bytes one QR code holds.
+  // frame(id) returns the bytes to put in the code.
+  var encoder = function (blob, capacity) {
+    var c = Math.min(capacity - HEADER, blob.length);
+    var k = Math.ceil(blob.length / c);
+    var id = new DataView(blob.buffer, blob.byteOffset, blob.byteLength)
+      .getUint32(blob.length - 8);
+    return {
+      chunks: k,
+      frame: function (frame_id) {
+        var out = new Uint8Array(HEADER + c);
+        var view = new DataView(out.buffer);
+        view.setUint8(0, MAGIC);
+        view.setUint32(1, id);
+        view.setUint32(5, blob.length);
+        view.setUint16(9, c);
+        view.setUint32(11, frame_id);
+        var data = out.subarray(HEADER);
+        sources(frame_id, k).forEach(function (i) { xor(data, blob, i * c); });
+        return out;
+      }
+    };
+  };
+
+  // Receiver: reads one QR payload. Returns null unless it is a well-formed
+  // frame within the size limits.
+  var parse = function (bytes) {
+    if (!bytes || bytes.length <= HEADER || bytes[0] !== MAGIC) return null;
+    var raw = Uint8Array.from(bytes);
+    var view = new DataView(raw.buffer);
+    var size = view.getUint32(5), c = view.getUint16(9);
+    if (size < 1 || size > MAX_SIZE || c < 1 || c > size) return null;
+    if (raw.length !== HEADER + c) return null;
+    var k = Math.ceil(size / c);
+    if (k > MAX_CHUNKS) return null;
+    return {
+      key: view.getUint32(1) + "/" + size + "/" + c, // identifies the transfer
+      size: size, chunk_size: c, chunks: k,
+      frame: view.getUint32(11),
+      data: raw.subarray(HEADER)
+    };
+  };
+
+  // Receiver: collects the frames of the transfer `first` belongs to.
+  var decoder = function (first) {
+    var k = first.chunks, c = first.chunk_size;
+    var store = new Uint8Array(k * c);  // chunk i lives at i * c once known
+    var known = new Uint8Array(k), known_count = 0;
+    // Unsolved repair frames in echelon form: pivot[i] is the row whose
+    // lowest unknown chunk is i. `bits` marks the chunks still XORed into
+    // `data`; bits of chunks learned later are cleared lazily.
+    var pivot = new Array(k), pivot_count = 0;
+    var words = Math.ceil(k / 32);
+
+    // Eliminates known chunks and existing pivots from a row, then files it
+    // under its lowest remaining chunk. A row that reduces to nothing told
+    // us nothing new and is dropped.
+    var reduce = function (row) {
+      for (var w = 0; w < words; w++) {
+        while (row.bits[w]) {
+          var bit = 31 - Math.clz32(row.bits[w] & -row.bits[w]);
+          var i = w * 32 + bit;
+          if (known[i]) {
+            xor(row.data, store, i * c);
+            row.bits[w] ^= 1 << bit;
+          } else if (pivot[i]) {
+            for (var v = w; v < words; v++) row.bits[v] ^= pivot[i].bits[v];
+            xor(row.data, pivot[i].data, 0);
+          } else {
+            pivot[i] = row;
+            pivot_count++;
+            return;
+          }
+        }
+      }
+    };
+
+    var learn = function (i, data) {
+      store.set(data, i * c);
+      known[i] = 1;
+      known_count++;
+      var row = pivot[i];
+      if (row) {
+        // the row that was going to yield chunk i now constrains other chunks
+        pivot[i] = null;
+        pivot_count--;
+        reduce(row);
+      }
+    };
+
+    return {
+      key: first.key,
+      chunks: k,
+      size: first.size,
+      // Independent frames collected so far; the transfer is done at `chunks`.
+      rank: function () { return known_count + pivot_count; },
+      add: function (f) {
+        if (f.frame < k) {
+          if (!known[f.frame]) learn(f.frame, f.data);
+          return;
+        }
+        if (pivot_count >= MAX_ROWS) return;
+        var row = { bits: new Uint32Array(words), data: f.data };
+        sources(f.frame, k).forEach(function (i) { row.bits[i >>> 5] |= 1 << (i & 31); });
+        reduce(row);
+      },
+      // The reassembled blob. Only valid once rank() equals chunks: every
+      // chunk is then known or a pivot, so back-substitution from the last
+      // chunk down resolves each row.
+      blob: function () {
+        for (var p = k - 1; p >= 0; p--) {
+          var row = pivot[p];
+          if (!row) continue;
+          for (var i = p + 1; i < k; i++) {
+            if (row.bits[i >>> 5] & (1 << (i & 31))) xor(row.data, store, i * c);
+          }
+          store.set(row.data, p * c);
+          known[p] = 1;
+          known_count++;
+          pivot[p] = null;
+          pivot_count--;
+        }
+        return store.subarray(0, first.size);
+      }
+    };
+  };
+
+  return { MAX_SIZE: MAX_SIZE, MAX_CHUNKS: MAX_CHUNKS,
+           pack: pack, unpack: unpack, encoder: encoder, parse: parse, decoder: decoder };
+})();
+
+    </script>
+    <script>
       (function () {
         var user_message = document.getElementById("user_message");
         var progress = document.getElementById("progress");
         var btn = document.getElementById("btn");
+        var btn_window = document.getElementById("btn_window");
         var video = document.getElementById("video");
         var scan = document.getElementById("scan");
+        var camera = document.getElementById("camera");
+        var stats = document.getElementById("stats");
 
-        var is_receiving = false, stream = null, meta = {}, decoded = {}, timer = null;
+        var is_receiving = false, stream = null, timer = null;
+        var can_capture_window = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
 
-        var decode_data = function (input_string) {
-          var encoded_data = atob(input_string.split(",")[1]);
-          var encoded_array = Array.from(encoded_data, function (char) {
-            return char.charCodeAt(0);
-          });
-          var output_string = new TextDecoder().decode(new Uint8Array(encoded_array));
-          return {
-            index: parseInt(input_string.split(",")[0], 10),
-            data: Array.from(output_string, function (char) {
-              return char.charCodeAt(0);
-            })
-          };
-        };
+        // The transfer being collected, and the last frame id seen (each code
+        // usually shows up in more than one camera frame).
+        var decoder = null, last_frame = -1;
+        // A frame from a different transfer only replaces the current one
+        // after this many arrive in a row, so one stray code cannot wipe it.
+        var SWITCH_AFTER = 3;
+        var rival_key = "", rival_count = 0;
 
-        var MAX_CHUNKS = 200000;
-        var MAX_SIZE = 64 * 1024 * 1024;
+        // Region of the video frame holding the QR code, in video pixels. Set
+        // once a code is found so later frames decode only that region,
+        // enlarged; null means the whole frame is searched.
+        var roi = null, roi_misses = 0, searches = 0;
+        var ROI_MARGIN_MODULES = 6; // padding around the code: its quiet zone and then some,
+        var ROI_MARGIN = 0.05;      // plus this fraction of its size as room to move
+        var ROI_MODULE_PX = 5;      // the region is scaled to this many pixels per QR module
+        var ROI_MAX_ZOOM = 4;
+        var ROI_MIN_ZOOM = 0.25;
+        var ROI_MAX_MISSES = 8;     // unreadable frames before searching the whole frame again
+        // Whole-frame searches alternate between these scales, since a dense
+        // code can be too fine to read (and so to locate) at camera resolution.
+        var SEARCH_ZOOMS = [1, 2];
+        var SEARCH_MAX_WIDTH = 2560;
 
         var safe_filename = function (name) {
           var n = String(name || "").split(/[\\/]/).pop();
@@ -10169,16 +10399,6 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           if (n === "." || n === "..") n = "";
           if (n.length > 200) n = n.slice(0, 200);
           return n || "received_file.bin";
-        };
-
-        var valid_meta = function (m) {
-          if (!m || typeof m !== "object" || Array.isArray(m)) return false;
-          if (typeof m.name !== "string" || m.name.length > 5000) return false;
-          if (!Number.isInteger(m.chunks) || m.chunks < 1 || m.chunks > MAX_CHUNKS) return false;
-          if (m.size !== undefined && m.size !== null) {
-            if (!Number.isInteger(m.size) || m.size < 0 || m.size > MAX_SIZE) return false;
-          }
-          return true;
         };
 
         var download_file = function (data, fileName) {
@@ -10192,80 +10412,130 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         };
 
         var render = function () {
-          var got = Object.keys(decoded).length;
-          var total = meta.chunks || 0;
-          progress.textContent = "Progress: " + got + " / " + total;
-          user_message.textContent = meta.name
-            ? ("Transferring file: " + meta.name)
-            : "Click receive button to start receiving";
+          progress.textContent = "Progress: " + (decoder ? decoder.rank() : 0) +
+            " / " + (decoder ? decoder.chunks : 0);
+          user_message.textContent = decoder
+            ? "Receiving " + Math.ceil(decoder.size / 1024) + " KB"
+            : is_receiving ? "Looking for a QR code"
+                           : "Click receive button to start receiving";
           btn.textContent = is_receiving ? "Stop Receiver" : "Start Receiver";
+          btn_window.hidden = is_receiving || !can_capture_window;
         };
 
-        var complete = function () {
-          var failed = null;
-          try {
-            var out = [];
-            for (var i = 0; i < meta.chunks; i++) {
-              out = out.concat(decoded[i]);
-            }
-            var unit8 = new Uint8Array(out);
-            var inflated = pako.inflate(unit8);
-            if (meta.size !== undefined && inflated.length !== meta.size) {
-              throw new Error("size mismatch: expected " + meta.size + " bytes, got " + inflated.length);
-            }
-            download_file(inflated, safe_filename(meta.name));
-          } catch (e) {
-            failed = e;
-          }
-          cancelAnimationFrame(timer);
-          is_receiving = false;
+        var next_frame = function () {
+          timer = video.requestVideoFrameCallback
+            ? video.requestVideoFrameCallback(scan_frame)
+            : requestAnimationFrame(scan_frame);
+        };
+
+        var stop_camera = function () {
+          if (video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(timer);
+          else cancelAnimationFrame(timer);
           if (stream) {
             stream.getTracks().forEach(function (t) { t.stop(); });
             stream = null;
           }
           video.srcObject = null;
-          meta = {};
-          decoded = {};
-          render();
+          camera.hidden = true;
+          roi = null;
+          stats.textContent = "";
+        };
+
+        // Square region around a decoded code's corners, mapped from scan
+        // canvas pixels back to video pixels and padded so the code stays
+        // inside it if the camera moves a little. `zoom` scales the region so
+        // each of the code's modules covers ROI_MODULE_PX pixels.
+        var region_around = function (code, src, zoom) {
+          var loc = code.location, modules = 17 + 4 * (code.version || 1);
+          var pts = [loc.topLeftCorner, loc.topRightCorner, loc.bottomLeftCorner, loc.bottomRightCorner];
+          var xs = pts.map(function (p) { return src.x + p.x / zoom; });
+          var ys = pts.map(function (p) { return src.y + p.y / zoom; });
+          var side = Math.max(Math.max.apply(null, xs) - Math.min.apply(null, xs),
+                              Math.max.apply(null, ys) - Math.min.apply(null, ys));
+          var pad = side * (ROI_MARGIN_MODULES / modules + ROI_MARGIN);
+          var x0 = Math.max(0, Math.floor(Math.min.apply(null, xs) - pad));
+          var y0 = Math.max(0, Math.floor(Math.min.apply(null, ys) - pad));
+          var x1 = Math.min(video.videoWidth, Math.ceil(Math.max.apply(null, xs) + pad));
+          var y1 = Math.min(video.videoHeight, Math.ceil(Math.max.apply(null, ys) + pad));
+          return { x: x0, y: y0, w: x1 - x0, h: y1 - y0,
+                   zoom: Math.min(ROI_MAX_ZOOM, Math.max(ROI_MIN_ZOOM, ROI_MODULE_PX * modules / side)) };
+        };
+
+        // Decodes the current video frame and returns the QR code's bytes, or
+        // null. With a tracked region only that part is decoded, scaled so
+        // small or dense codes still have several pixels per module.
+        var decode_frame = function () {
+          var src = roi || { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
+          var zoom = roi ? roi.zoom
+            : Math.min(SEARCH_ZOOMS[searches++ % SEARCH_ZOOMS.length], SEARCH_MAX_WIDTH / src.w);
+          scan.width = Math.round(src.w * zoom);
+          scan.height = Math.round(src.h * zoom);
+          var ctx = scan.getContext("2d", { willReadFrequently: true });
+          ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, scan.width, scan.height);
+          var image = ctx.getImageData(0, 0, scan.width, scan.height);
+          var started = Date.now();
+          var code = jsQR(image.data, scan.width, scan.height, { inversionAttempts: "dontInvert" });
+          stats.textContent = "Video " + video.videoWidth + "x" + video.videoHeight +
+            (roi ? ", tracking code at " : ", searching whole frame at ") + zoom.toFixed(1) + "x" +
+            ", decode " + (Date.now() - started) + "ms";
+          if (!code) {
+            if (roi && ++roi_misses >= ROI_MAX_MISSES) roi = null;
+            return null;
+          }
+          roi_misses = 0;
+          if (code.location) roi = region_around(code, src, zoom);
+          return code.binaryData;
+        };
+
+        var complete = function () {
+          var failed = null, name = "";
+          try {
+            var file = AirgapCodec.unpack(decoder.blob());
+            name = safe_filename(file.name);
+            download_file(file.bytes, name);
+          } catch (e) {
+            failed = e;
+          }
+          stop_receiving();
           user_message.textContent = failed
             ? "Transfer failed: " + (failed.message || String(failed))
-            : "Data Transfer Complete";
+            : "Received \"" + name + "\"";
+        };
+
+        // Feeds one decoded QR payload to the current transfer.
+        var accept = function (bytes) {
+          var f = AirgapCodec.parse(bytes);
+          if (!f) {
+            if (!decoder) {
+              user_message.textContent = "Found a QR code, but not one from this sender. " +
+                "If the sender page is an older version, reload it.";
+            }
+            return;
+          }
+          if (decoder && decoder.key !== f.key) {
+            rival_count = f.key === rival_key ? rival_count + 1 : 1;
+            rival_key = f.key;
+            if (rival_count < SWITCH_AFTER) return;
+            decoder = null;
+          }
+          rival_count = 0;
+          if (!decoder) {
+            decoder = AirgapCodec.decoder(f);
+            last_frame = -1;
+          }
+          if (f.frame === last_frame) return;
+          last_frame = f.frame;
+          decoder.add(f);
+          render();
         };
 
         var scan_frame = function () {
           if (!is_receiving) return;
           try {
             if (video.videoWidth > 0 && video.videoHeight > 0) {
-              var scale = Math.min(1, 640 / video.videoWidth);
-              scan.width = Math.round(video.videoWidth * scale);
-              scan.height = Math.round(video.videoHeight * scale);
-              var ctx = scan.getContext("2d", { willReadFrequently: true });
-              ctx.drawImage(video, 0, 0, scan.width, scan.height);
-              var image = ctx.getImageData(0, 0, scan.width, scan.height);
-              var code = jsQR(image.data, scan.width, scan.height);
-              if (code) {
-                var data = code.data;
-                if (data.charAt(0) === "{") {
-                  try {
-                    var m = JSON.parse(data);
-                    if (valid_meta(m) &&
-                        (m.name !== meta.name || m.chunks !== meta.chunks || m.size !== meta.size)) {
-                      meta = m;
-                      decoded = {};
-                    }
-                  } catch (e) { /* ignore malformed metadata */ }
-                } else if (data.split(",").length === 2) {
-                  try {
-                    var raw = decode_data(data);
-                    if (Number.isInteger(raw.index) && raw.index >= 0 &&
-                        (!meta.chunks || raw.index < meta.chunks)) {
-                      decoded[raw.index] = raw.data;
-                    }
-                  } catch (e) { /* ignore malformed chunk */ }
-                }
-                render();
-              }
-              if (meta.chunks && Object.keys(decoded).length >= meta.chunks) {
+              var bytes = decode_frame();
+              if (bytes) accept(bytes);
+              if (decoder && decoder.rank() >= decoder.chunks) {
                 complete();
                 return;
               }
@@ -10273,48 +10543,100 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
           } catch (e) {
             /* skip unreadable frame */
           }
-          timer = requestAnimationFrame(scan_frame);
+          next_frame();
         };
 
-        btn.addEventListener("click", function () {
-          if (is_receiving) {
-            is_receiving = false;
-            cancelAnimationFrame(timer);
-            if (stream) {
-              stream.getTracks().forEach(function (t) { t.stop(); });
-              stream = null;
-            }
-            video.srcObject = null;
-            meta = {};
-            decoded = {};
-            render();
-            return;
-          }
+        // Starts scanning a newly opened stream, replacing the current one.
+        var use_stream = function (s) {
+          if (!is_receiving) { s.getTracks().forEach(function (t) { t.stop(); }); return false; }
+          stop_camera();
+          stream = s;
+          video.srcObject = s;
+          scan_frame();
+          return true;
+        };
+
+        // Opens the chosen camera (or the rear-facing default) at the highest
+        // resolution it offers up to 1080p; browsers default to 640x480.
+        var open_camera = function (device_id) {
+          var want = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+          if (device_id) want.deviceId = { exact: device_id };
+          else want.facingMode = "environment";
+          return navigator.mediaDevices.getUserMedia({ video: want }).then(function (s) {
+            if (use_stream(s)) list_cameras();
+          });
+        };
+
+        // Scans a window or screen of this machine instead of a camera, e.g.
+        // a remote desktop client showing the sender. The browser asks which.
+        var open_window = function () {
+          return navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 } } })
+            .then(function (s) {
+              if (!use_stream(s)) return;
+              // sharing ended from the browser's own controls
+              s.getVideoTracks()[0].addEventListener("ended", function () {
+                if (stream === s) stop_receiving();
+              });
+            });
+        };
+
+        // Fills the camera picker. Labels are only available once camera
+        // permission has been granted, so this runs after a stream opens.
+        var list_cameras = function () {
+          if (!navigator.mediaDevices.enumerateDevices) return;
+          var track = stream.getVideoTracks()[0];
+          var current = track ? track.getSettings().deviceId : "";
+          navigator.mediaDevices.enumerateDevices().then(function (devices) {
+            var cams = devices.filter(function (d) { return d.kind === "videoinput"; });
+            camera.textContent = "";
+            cams.forEach(function (d, i) {
+              var opt = document.createElement("option");
+              opt.value = d.deviceId;
+              opt.textContent = d.label || "Camera " + (i + 1);
+              opt.selected = d.deviceId === current;
+              camera.appendChild(opt);
+            });
+            camera.hidden = cams.length < 2;
+          });
+        };
+
+        var source_failed = function (e) {
+          stop_receiving();
+          user_message.textContent = "Video error: " + e.message;
+        };
+
+        // Switching cameras mid-transfer keeps the chunks received so far.
+        camera.addEventListener("change", function () {
+          if (is_receiving) open_camera(camera.value).catch(source_failed);
+        });
+
+        var stop_receiving = function () {
+          is_receiving = false;
+          stop_camera();
+          decoder = null;
+          render();
+        };
+
+        // Begins a fresh transfer from the stream that `open` resolves to.
+        var start_receiving = function (open) {
           is_receiving = true;
-          decoded = {};
-          meta = {};
+          decoder = null;
           render();
           if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            is_receiving = false;
-            render();
+            stop_receiving();
             user_message.textContent =
               "Camera unavailable: this page must be opened from a secure context " +
               "(e.g. http://localhost) to access the camera.";
             return;
           }
-          navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-            .then(function (s) {
-              if (!is_receiving) { s.getTracks().forEach(function (t) { t.stop(); }); return; }
-              stream = s;
-              video.srcObject = s;
-              scan_frame();
-            })
-            .catch(function (e) {
-              is_receiving = false;
-              user_message.textContent = "Camera error: " + e.message;
-              render();
-            });
+          open().catch(source_failed);
+        };
+
+        btn.addEventListener("click", function () {
+          if (is_receiving) stop_receiving();
+          else start_receiving(function () { return open_camera(camera.value); });
         });
+        btn_window.addEventListener("click", function () { start_receiving(open_window); });
 
         render();
       })();

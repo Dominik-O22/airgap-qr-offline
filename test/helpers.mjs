@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import vm from "node:vm";
+import { gzipSync } from "node:zlib";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -49,14 +50,16 @@ function makeEl(id, downloads) {
     srcObject: null,
     download: "",
     href: "",
+    style: {},
     listeners: {},
     addEventListener(type, fn) {
       (this.listeners[type] ||= []).push(fn);
     },
-    // canvas stub for the scanner's <canvas id="scan">
+    // canvas stub for the scanner's <canvas id="scan"> and the generator's QR canvas
     getContext() {
       return {
         drawImage() {},
+        fillRect() {},
         getImageData: () => ({ data: new Uint8ClampedArray(64 * 64 * 4) }),
       };
     },
@@ -93,16 +96,16 @@ export function loadPage(file) {
     return els.get(id);
   };
 
-  const qrFrames = []; // texts passed to QRCode.makeCode()
-  function QRCode(elId, opts) {
-    this.elId = elId;
-    this.opts = opts;
-  }
-  QRCode.CorrectLevel = { L: 1, M: 2, Q: 3, H: 4 };
-  QRCode.prototype.clear = function () {};
-  QRCode.prototype.makeCode = function (text) {
-    qrFrames.push(text);
-  };
+  // Stand-in for qrcode-generator: records the bytes of every code drawn.
+  const qrFrames = [];
+  const qrcode = () => ({
+    addData(text) {
+      qrFrames.push(Uint8Array.from(text, (ch) => ch.charCodeAt(0)));
+    },
+    make() {},
+    getModuleCount: () => 21,
+    isDark: () => false,
+  });
 
   const timers = makeQueue(); // generator's setTimeout loop
   const raf = makeQueue(); // scanner's requestAnimationFrame loop
@@ -123,8 +126,16 @@ export function loadPage(file) {
       },
     },
     window: { innerWidth: 1024, innerHeight: 768 },
-    QRCode,
-    jsQR: () => (feed.length ? { data: feed.shift() } : null),
+    qrcode,
+    // Stand-in for jsQR: each camera frame "sees" the next queued payload.
+    // Strings are text codes, byte arrays are binary codes.
+    jsQR: () => {
+      if (!feed.length) return null;
+      const payload = feed.shift();
+      return typeof payload === "string"
+        ? { data: payload, binaryData: Array.from(Buffer.from(payload)) }
+        : { data: "", binaryData: Array.from(payload) };
+    },
     Blob: FakeBlob,
     URL: { createObjectURL: () => "blob:test", revokeObjectURL() {} },
     TextEncoder,
@@ -139,9 +150,9 @@ export function loadPage(file) {
   });
 
   // Evaluate every inline script except the vendored QR-code libraries
-  // (qrcode.js and jsQR), which the stubs above replace.
+  // (qrcode-generator and jsQR), which the stubs above replace.
   for (const code of scripts) {
-    if (code.includes("var QRCode;") || code.includes("webpackUniversalModuleDefinition")) {
+    if (code.includes("var qrcode=function") || code.includes("webpackUniversalModuleDefinition")) {
       continue;
     }
     vm.runInContext(code, ctx, { filename: file });
@@ -171,30 +182,56 @@ export function loadPage(file) {
   };
 }
 
-export const loadGenerator = () => loadPage("offline/generator.html");
+// The generator starts on its fastest speed and smallest code size, so small
+// test files still span several chunks.
+export const SMALL_CODE = 367;
+export function loadGenerator() {
+  const page = loadPage("offline/generator.html");
+  page.el("speed").value = "50";
+  page.el("density").value = String(SMALL_CODE);
+  return page;
+}
 export const loadScanner = () => loadPage("offline/scanner.html");
 
-// ---- helpers for crafting attacker-controlled QR payloads ----
+// ---- helpers for crafting QR payloads by hand ----
 
-// Mirror of the sender's chunk encoding: raw bytes are treated as latin-1
-// characters, re-encoded as UTF-8, then base64'd:  "index,<base64>"
-export function encodeChunk(index, bytes) {
-  const latin1 = Array.from(bytes, (b) => String.fromCharCode(b)).join("");
-  return index + "," + Buffer.from(latin1, "utf8").toString("base64");
+export const HEADER = 15;
+
+// One binary frame, laid out as in offline/templates/codec.js.
+export function frame({ id = 1, size, chunkSize, frameId = 0, data, magic = 0xa9 }) {
+  const out = Buffer.alloc(HEADER + data.length);
+  out.writeUInt8(magic, 0);
+  out.writeUInt32BE(id, 1);
+  out.writeUInt32BE(size, 5);
+  out.writeUInt16BE(chunkSize, 9);
+  out.writeUInt32BE(frameId, 11);
+  out.set(data, HEADER);
+  return out;
 }
 
-// Build the frames an honest sender would emit for the given bytes/name,
-// using real gzip so the payloads actually decompress.
-export function senderFrames(name, bytes, { gzipSync }) {
-  const gz = gzipSync(bytes);
-  const meta = JSON.stringify({
-    name,
-    chunks: Math.max(1, Math.ceil(gz.length / 250)),
-    size: bytes.length,
-  });
-  const chunks = [];
-  for (let i = 0; i < Math.ceil(gz.length / 250); i++) {
-    chunks.push(encodeChunk(i, gz.subarray(i * 250, (i + 1) * 250)));
+export const readHeader = (f) => {
+  const b = Buffer.from(f);
+  const size = b.readUInt32BE(5), chunkSize = b.readUInt16BE(9);
+  return { size, chunkSize, chunks: Math.ceil(size / chunkSize), frameId: b.readUInt32BE(11) };
+};
+
+// The blob an honest sender builds: gzip([u16 name length][name][bytes]).
+export function blobFor(name, bytes) {
+  const nameBytes = Buffer.from(name, "utf8");
+  const head = Buffer.alloc(2);
+  head.writeUInt16BE(nameBytes.length);
+  return gzipSync(Buffer.concat([head, nameBytes, Buffer.from(bytes)]));
+}
+
+// The plain (non-repair) frames an honest sender emits for a blob.
+export function chunkFrames(blob, chunkSize = SMALL_CODE - HEADER) {
+  const c = Math.min(chunkSize, blob.length);
+  const frames = [];
+  for (let i = 0; i * c < blob.length; i++) {
+    const data = Buffer.alloc(c);
+    blob.copy(data, 0, i * c, (i + 1) * c);
+    frames.push(frame({ id: blob.readUInt32BE(blob.length - 8), size: blob.length,
+                        chunkSize: c, frameId: i, data }));
   }
-  return [meta, ...chunks];
+  return frames;
 }

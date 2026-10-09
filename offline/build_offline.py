@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the fully-offline (single-file) versions of the QR transfer site.
 
-Every dependency (pako, qrcodejs, jsQR) is inlined into a single HTML file so
+Every dependency (pako, qrcode-generator, jsQR) is inlined into a single HTML file so
 the resulting pages have no external references and work from file://. The
 pages register a service worker (sw.js) so that once opened over http(s) they
 are precached and work offline.
@@ -23,15 +23,21 @@ TEMPLATES = HERE / "templates"
 
 LIBS = {
     "pako.min.js": "https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.3/pako.min.js",
-    "qrcode.min.js": "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js",
+    "qrcode-generator.min.js":
+        "https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js",
     "jsQR.js": "https://unpkg.com/jsqr@1.4.0/dist/jsQR.js",
 }
 
+# The wire format shared by both pages; ours, so it lives with the templates.
+CODEC = TEMPLATES / "codec.js"
+
 JOBS = [
-    ("generator.tpl.html", "generator.html", {"__PAKO__": "pako.min.js",
-                                              "__QRCODE__": "qrcode.min.js"}),
-    ("scanner.tpl.html", "scanner.html", {"__PAKO__": "pako.min.js",
-                                          "__JSQR__": "jsQR.js"}),
+    ("generator.tpl.html", "generator.html", {"__PAKO__": VENDOR / "pako.min.js",
+                                              "__QRCODE__": VENDOR / "qrcode-generator.min.js",
+                                              "__CODEC__": CODEC}),
+    ("scanner.tpl.html", "scanner.html", {"__PAKO__": VENDOR / "pako.min.js",
+                                          "__JSQR__": VENDOR / "jsQR.js",
+                                          "__CODEC__": CODEC}),
 ]
 
 
@@ -53,7 +59,7 @@ def main():
     for template, output, markers in JOBS:
         tpl = (TEMPLATES / template).read_text()
         for marker, lib in markers.items():
-            content = (VENDOR / lib).read_text()
+            content = lib.read_text()
             tpl = tpl.replace(marker, content.replace("</script", "<\\/script"))
         out = HERE / output
         out.write_text(tpl)

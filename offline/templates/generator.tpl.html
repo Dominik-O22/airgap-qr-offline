@@ -8,7 +8,7 @@
       * { box-sizing: border-box; }
       body { font-family: Arial, sans-serif; margin: 0; background: #f4f4f4; color: #333; }
       .card { max-width: 640px; margin: 0 auto; padding: 20px; background: #fff;
-              min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+              display: flex; flex-direction: column; align-items: center;
               box-shadow: 0 0 10px rgba(0, 0, 0, 0.1); }
       .title { font-size: 1.25rem; margin: 1rem 0; }
       .message { font-size: 0.9rem; margin: 0 0 1rem; color: #555; text-align: center; }
@@ -26,8 +26,7 @@
                cursor: pointer; font-size: 1rem; }
       button:hover:not(:disabled) { background: #e5e7eb; }
       button:disabled { opacity: 0.5; cursor: default; }
-      #qrcode { display: flex; justify-content: center; width: 100%; }
-      #qrcode canvas, #qrcode img { max-width: 100%; height: auto; }
+      #qrcode { display: block; margin: 8px auto; image-rendering: pixelated; }
     </style>
   </head>
   <body>
@@ -48,15 +47,30 @@
           <option value="2000">Slow (2s per code)</option>
           <option value="1000">Normal (1s per code)</option>
           <option value="250" selected>Fast (0.25s per code)</option>
+          <option value="100">Faster (0.1s per code)</option>
+          <option value="50">Fastest (0.05s per code)</option>
         </select>
       </label>
-      <div id="qrcode"></div>
+      <label class="row">
+        Code size:
+        <select id="density">
+          <option value="367">Small (0.4 KB per code)</option>
+          <option value="718">Medium (0.7 KB per code)</option>
+          <option value="1273" selected>Large (1.3 KB per code)</option>
+          <option value="1732">Very large (1.7 KB per code)</option>
+          <option value="2953">Maximum (2.9 KB per code)</option>
+        </select>
+      </label>
     </div>
+    <canvas id="qrcode" width="0" height="0"></canvas>
     <script>
 __PAKO__
     </script>
     <script>
 __QRCODE__
+    </script>
+    <script>
+__CODEC__
     </script>
     <script>
       (function () {
@@ -67,10 +81,13 @@ __QRCODE__
         var file_input = document.getElementById("file_input");
         var text_input = document.getElementById("text_input");
         var speed = document.getElementById("speed");
-        var chunk_size = 250;
+        var density = document.getElementById("density");
+        var canvas = document.getElementById("qrcode");
         var MAX_TEXT_LENGTH = 1000000;
+        var QUIET = 4; // white modules around the code, so it scans on any page background
 
-        var qrcode_object, is_transferring = false, frames = [], idx = 0, timer = null;
+        // `pos` counts the codes shown so far; frame_id() maps it to a frame.
+        var is_transferring = false, blob = null, enc = null, pos = 0, timer = null;
         var current_name = "";
 
         var paste_name = function () {
@@ -130,27 +147,58 @@ __QRCODE__
           return { ok: true };
         };
 
-        var encode_data = function (index, input_bytes) {
-          var encoded_string = String.fromCharCode.apply(null, input_bytes);
-          var utf8_bytes = new TextEncoder().encode(encoded_string);
-          return index + "," + btoa(String.fromCharCode.apply(null, utf8_bytes));
+        // Extra repair frames sent after each pass over the chunks.
+        var repair_count = function () {
+          return Math.ceil(enc.chunks / 8) + (enc.chunks > 1 ? 4 : 0);
         };
 
-        var show = function (i) {
-          var n = frames.length;
-          idx = ((i % n) + n) % n;
-          qrcode_object.clear();
-          qrcode_object.makeCode(frames[idx]);
-          user_message.textContent = idx === 0
-            ? "Sending \"" + current_name + "\" - scan the metadata QR code"
-            : "Transferring \"" + current_name + "\" (chunk " + idx + "/" + (n - 1) + ")";
+        // The sender loops: every chunk in order, then a batch of repair
+        // frames. Repair frame ids keep increasing, so each loop sends new ones.
+        var frame_id = function (p) {
+          var k = enc.chunks, r = repair_count();
+          var loop = Math.floor(p / (k + r)), offset = p % (k + r);
+          return offset < k ? offset : k + loop * r + (offset - k);
+        };
+
+        // Draws one frame as a byte-mode QR code at a whole number of device
+        // pixels per module, as large as the window allows.
+        var draw = function (bytes) {
+          var qr = qrcode(0, "L");
+          qr.addData(String.fromCharCode.apply(null, bytes), "Byte");
+          qr.make();
+          var n = qr.getModuleCount(), total = n + 2 * QUIET;
+          var dpr = window.devicePixelRatio || 1;
+          var side = (Math.min(window.innerWidth, window.innerHeight) - 16) * dpr;
+          var cell = Math.max(1, Math.floor(side / total));
+          canvas.width = canvas.height = total * cell;
+          canvas.style.width = canvas.style.height = (total * cell / dpr) + "px";
+          var ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#ffffff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "#000000";
+          for (var row = 0; row < n; row++) {
+            for (var col = 0; col < n; col++) {
+              if (qr.isDark(row, col)) {
+                ctx.fillRect((col + QUIET) * cell, (row + QUIET) * cell, cell, cell);
+              }
+            }
+          }
+        };
+
+        var show = function (p) {
+          pos = Math.max(0, p);
+          var id = frame_id(pos);
+          draw(enc.frame(id));
+          user_message.textContent = "Sending \"" + current_name + "\": " +
+            (id < enc.chunks ? "chunk " + (id + 1) + " of " + enc.chunks
+                             : "repair code for " + enc.chunks + " chunks");
         };
 
         var schedule = function () {
           clearTimeout(timer);
           timer = setTimeout(function () {
             if (is_transferring) {
-              show(idx + 1);
+              show(pos + 1);
               schedule();
             }
           }, parseInt(speed.value, 10));
@@ -165,15 +213,24 @@ __QRCODE__
           user_message.textContent = "Choose a file or paste text to get started";
         };
 
-        var begin_transfer = function (bytes, name) {
-          var data_array = pako.gzip(bytes, { level: 9 });
-          var total_chunks = Math.ceil(data_array.length / chunk_size);
-          frames = [JSON.stringify({ name: safe_name(name), chunks: total_chunks, size: bytes.length })];
-          for (var i = 0; i < total_chunks; i++) {
-            frames.push(encode_data(i, data_array.subarray(i * chunk_size, (i + 1) * chunk_size)));
+        var start_encoder = function () {
+          enc = AirgapCodec.encoder(blob, parseInt(density.value, 10));
+          if (enc.chunks > AirgapCodec.MAX_CHUNKS) {
+            user_message.textContent = "File needs too many codes, pick a larger code size";
+            return false;
           }
+          return true;
+        };
+
+        var begin_transfer = function (bytes, name) {
           current_name = safe_name(name);
-          user_message.textContent = "Sending \"" + current_name + "\"";
+          blob = AirgapCodec.pack(current_name, bytes);
+          if (blob.length > AirgapCodec.MAX_SIZE) {
+            user_message.textContent = "File too large: " + blob.length +
+              " bytes compressed (max " + AirgapCodec.MAX_SIZE + ")";
+            return;
+          }
+          if (!start_encoder()) return;
           is_transferring = true;
           btn_start.textContent = "Stop Transfer";
           btn_prev.disabled = false;
@@ -203,24 +260,20 @@ __QRCODE__
         };
 
         btn_start.addEventListener("click", start_transfer);
-        btn_prev.addEventListener("click", function () { show(idx - 1); schedule(); });
-        btn_next.addEventListener("click", function () { show(idx + 1); schedule(); });
+        btn_prev.addEventListener("click", function () { show(pos - 1); schedule(); });
+        btn_next.addEventListener("click", function () { show(pos + 1); schedule(); });
         speed.addEventListener("change", schedule);
+        // A new code size is a new transfer as far as the receiver is concerned.
+        density.addEventListener("change", function () {
+          if (!is_transferring) return;
+          if (!start_encoder()) { stop_transfer(); return; }
+          show(0);
+          schedule();
+        });
 
         if ("serviceWorker" in navigator) {
           navigator.serviceWorker.register("./sw.js").catch(function () {});
         }
-
-        var size = Math.max(256, Math.min(window.innerWidth, window.innerHeight) / 1.5);
-        qrcode_object = new QRCode("qrcode", {
-          text: "Choose file to get started",
-          width: size,
-          height: size,
-          typeNumber: 40,
-          colorDark: "#000000",
-          colorLight: "#ffffff",
-          correctLevel: QRCode.CorrectLevel.M
-        });
       })();
     </script>
   </body>

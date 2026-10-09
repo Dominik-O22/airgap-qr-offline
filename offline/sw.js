@@ -1,11 +1,12 @@
-const CACHE = "airgap-qr-offline-v3";
+const CACHE = "airgap-qr-offline-v7";
 const PRECACHE = ["./index.html", "./generator.html", "./scanner.html", "./about.html"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(
     caches
       .open(CACHE)
-      .then((c) => c.addAll(PRECACHE))
+      // bypass the HTTP cache, or a new version would precache stale pages
+      .then((c) => c.addAll(PRECACHE.map((url) => new Request(url, { cache: "reload" }))))
       .then(() => self.skipWaiting())
   );
 });

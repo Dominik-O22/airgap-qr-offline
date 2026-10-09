@@ -28,16 +28,20 @@ LIBS = {
     "jsQR.js": "https://unpkg.com/jsqr@1.4.0/dist/jsQR.js",
 }
 
-# The wire format shared by both pages; ours, so it lives with the templates.
+# The wire format and the grid code shared by both pages; ours, so they live
+# with the templates.
 CODEC = TEMPLATES / "codec.js"
+GRID = TEMPLATES / "grid.js"
 
 JOBS = [
     ("generator.tpl.html", "generator.html", {"__PAKO__": VENDOR / "pako.min.js",
                                               "__QRCODE__": VENDOR / "qrcode-generator.min.js",
-                                              "__CODEC__": CODEC}),
+                                              "__CODEC__": CODEC,
+                                              "__GRID__": GRID}),
     ("scanner.tpl.html", "scanner.html", {"__PAKO__": VENDOR / "pako.min.js",
                                           "__JSQR__": VENDOR / "jsQR.js",
-                                          "__CODEC__": CODEC}),
+                                          "__CODEC__": CODEC,
+                                          "__GRID__": GRID}),
 ]
 
 

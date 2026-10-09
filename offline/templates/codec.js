@@ -16,6 +16,11 @@
 // frame: the XOR of a pseudo-random subset of chunks derived from its id.
 // The receiver solves for lost chunks by Gaussian elimination, so any K
 // linearly independent frames rebuild the blob, whichever ones were missed.
+//
+// A QR code carries one frame and relies on QR's own error correction. A grid
+// code (grid.js) has none and carries several frames at once, as a bundle:
+// each frame followed by its CRC32, back to back, so damage to one part of
+// the picture only costs the frames it touches.
 var AirgapCodec = (function () {
   var MAGIC = 0xa9;
   var HEADER = 15;
@@ -50,6 +55,53 @@ var AirgapCodec = (function () {
   var xor = function (dst, src, offset) {
     var n = Math.min(dst.length, src.length - offset);
     for (var i = 0; i < n; i++) dst[i] ^= src[offset + i];
+  };
+
+  var CRC_TABLE = (function () {
+    var table = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c;
+    }
+    return table;
+  })();
+
+  var crc32 = function (bytes, start, end) {
+    var c = 0xffffffff;
+    for (var i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+
+  // Sender: packs frames of one size into `capacity` bytes for a grid code.
+  var bundle = function (frames, capacity) {
+    var out = new Uint8Array(capacity), view = new DataView(out.buffer), o = 0;
+    frames.forEach(function (f) {
+      out.set(f, o);
+      view.setUint32(o + f.length, crc32(f, 0, f.length));
+      o += f.length + 4;
+    });
+    return out;
+  };
+
+  // Receiver: the frames of a bundle whose checksums hold. The frame size
+  // comes from the first frame's header; if that frame is damaged,
+  // `known_size` (returned as `size` by an earlier call) is used instead.
+  var unbundle = function (bytes, known_size) {
+    var view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    var intact = function (o, size) {
+      return size > HEADER && o + size + 4 <= bytes.length && bytes[o] === MAGIC &&
+             crc32(bytes, o, o + size) === view.getUint32(o + size);
+    };
+    var size = bytes.length >= HEADER ? HEADER + view.getUint16(9) : 0;
+    if (!intact(0, size)) size = known_size;
+    var frames = [];
+    if (size) {
+      for (var o = 0; o + size + 4 <= bytes.length; o += size + 4) {
+        if (intact(o, size)) frames.push(bytes.subarray(o, o + size));
+      }
+    }
+    return { frames: frames, size: frames.length ? size : 0 };
   };
 
   // Sender: builds the blob for a named file.
@@ -90,6 +142,7 @@ var AirgapCodec = (function () {
       .getUint32(blob.length - 8);
     return {
       chunks: k,
+      frame_size: HEADER + c,
       frame: function (frame_id) {
         var out = new Uint8Array(HEADER + c);
         var view = new DataView(out.buffer);
@@ -209,5 +262,6 @@ var AirgapCodec = (function () {
   };
 
   return { MAX_SIZE: MAX_SIZE, MAX_CHUNKS: MAX_CHUNKS,
-           pack: pack, unpack: unpack, encoder: encoder, parse: parse, decoder: decoder };
+           pack: pack, unpack: unpack, encoder: encoder, parse: parse, decoder: decoder,
+           bundle: bundle, unbundle: unbundle };
 })();

@@ -1,0 +1,57 @@
+<!-- Minimal sender: small enough to type by hand on a machine nothing can be
+     copied to. Pick a file and it loops grid codes (see templates/grid.js and
+     templates/codec.js) for the normal receiver's "Capture a Window". Black
+     and white cells only, no repair codes, no libraries. Comments and
+     indentation can be left out when typing. -->
+<input type=file id=f><br><canvas id=c style="image-rendering:pixelated"></canvas>
+<script>
+f.onchange = async () => {
+  const C = 4, B = 12, file = f.files[0];  // cell and border size in pixels
+  const name = new TextEncoder().encode(file.name);
+  // the blob: gzip([name length, 2 bytes][name][file])
+  const z = new Uint8Array(await new Response(
+    new Blob([new Uint8Array([name.length >> 8, name.length]), name, file])
+      .stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer());
+  const odd = n => n - 1 | 1;
+  const cols = odd((innerWidth - 20 - 9 * B) / C), rows = odd((innerHeight - 60 - 9 * B) / C);
+  const w = c.width = cols * C + 9 * B, h = c.height = rows * C + 9 * B;
+  // bytes per picture, split into frames of about 1 KB: 15 header + n data + 4 checksum
+  const cap = cols * rows >> 3, parts = Math.round(cap / 1024) || 1;
+  const n = Math.min((cap / parts | 0) - 19, z.length);
+  const total = Math.ceil(z.length / n), per = Math.min(cap / (n + 19) | 0, total);
+  // border, gap and timing marks
+  const g = c.getContext("2d");
+  const box = (colour, x, y, bw, bh) => { g.fillStyle = colour; g.fillRect(x, y, bw, bh); };
+  box("#fff", 0, 0, w, h);
+  box("#000", 2 * B, 2 * B, w - 4 * B, h - 4 * B);
+  box("#fff", 3 * B, 3 * B, w - 6 * B, h - 6 * B);
+  for (let i = 0; i < cols; i += 2) box("#000", 5 * B + i * C, 4 * B, C, B);
+  for (let i = 0; i < rows; i += 2) box("#000", 4 * B, 5 * B + i * C, B, C);
+  const image = g.createImageData(cols * C, rows * C), px = new Uint32Array(image.data.buffer);
+  const crc = Array.from({ length: 256 }, (_, v) => {
+    for (let j = 0; j < 8; j++) v = v & 1 ? 0xEDB88320 ^ v >>> 1 : v >>> 1;
+    return v;
+  });
+  let next = 0;
+  setInterval(() => {
+    const buf = new Uint8Array(cap), view = new DataView(buf.buffer);
+    for (let k = 0, o = 0; k < per; k++, o += n + 19, next = (next + 1) % total) {
+      buf[o] = 0xA9;
+      buf.set(z.subarray(z.length - 8, z.length - 4), o + 1);
+      view.setUint32(o + 5, z.length);
+      view.setUint16(o + 9, n);
+      view.setUint32(o + 11, next);
+      buf.set(z.subarray(next * n, next * n + n), o + 15);
+      let r = -1;
+      for (let i = o; i < o + 15 + n; i++) r = crc[(r ^ buf[i]) & 255] ^ r >>> 8;
+      view.setUint32(o + 15 + n, ~r);
+    }
+    for (let i = 0; i < cols * rows; i++) {
+      const at = ((i / cols | 0) * cols * C + i % cols) * C;
+      const colour = buf[i >> 3] >> (7 - (i & 7)) & 1 ? 0xFF000000 : -1;
+      for (let y = 0; y < C; y++) px.fill(colour, at + y * cols * C, at + y * cols * C + C);
+    }
+    g.putImageData(image, 5 * B, 5 * B);
+  }, 50);
+};
+</script>

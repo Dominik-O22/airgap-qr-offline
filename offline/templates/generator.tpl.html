@@ -26,7 +26,7 @@
                cursor: pointer; font-size: 1rem; }
       button:hover:not(:disabled) { background: #e5e7eb; }
       button:disabled { opacity: 0.5; cursor: default; }
-      #qrcode { display: block; margin: 8px auto; image-rendering: pixelated; }
+      #qrcode { display: block; margin: 8px; image-rendering: pixelated; }
     </style>
   </head>
   <body>
@@ -61,6 +61,24 @@
           <option value="2953">Maximum (2.9 KB per code)</option>
         </select>
       </label>
+      <label class="row">
+        Code type:
+        <select id="kind">
+          <option value="qr" selected>QR code (camera or window capture)</option>
+          <option value="grid">Grid (window capture only, much faster)</option>
+        </select>
+      </label>
+      <label class="row">
+        Grid cell:
+        <select id="cell">
+          <option value="3">3 px</option>
+          <option value="4" selected>4 px</option>
+          <option value="6">6 px</option>
+          <option value="8">8 px</option>
+          <option value="12">12 px</option>
+        </select>
+        <input id="colour" type="checkbox" /> Colour (3x the data)
+      </label>
     </div>
     <canvas id="qrcode" width="0" height="0"></canvas>
     <script>
@@ -73,6 +91,9 @@ __QRCODE__
 __CODEC__
     </script>
     <script>
+__GRID__
+    </script>
+    <script>
       (function () {
         var user_message = document.getElementById("user_message");
         var btn_start = document.getElementById("btn_start");
@@ -82,12 +103,21 @@ __CODEC__
         var text_input = document.getElementById("text_input");
         var speed = document.getElementById("speed");
         var density = document.getElementById("density");
+        var kind = document.getElementById("kind");
+        var cell_size = document.getElementById("cell");
+        var colour = document.getElementById("colour");
         var canvas = document.getElementById("qrcode");
         var MAX_TEXT_LENGTH = 1000000;
         var QUIET = 4; // white modules around the code, so it scans on any page background
 
-        // `pos` counts the codes shown so far; frame_id() maps it to a frame.
+        // `pos` counts the codes shown so far. A QR code carries one frame and
+        // a grid code `per_code` of them; frame_id() maps a running frame
+        // number to the frame to send.
         var is_transferring = false, blob = null, enc = null, pos = 0, timer = null;
+        var per_code = 1;
+        // Grid mode only: the picture's geometry, pixels and data-cell painter.
+        var grid = null, grid_image = null, grid_paint = null;
+        var GRID_FRAME = 1024; // rough bytes per frame within a grid code
         var current_name = "";
 
         var paste_name = function () {
@@ -147,9 +177,10 @@ __CODEC__
           return { ok: true };
         };
 
-        // Extra repair frames sent after each pass over the chunks.
+        // Extra repair frames sent after each pass over the chunks. Half a
+        // pass covers a receiver that misses up to a third of the codes.
         var repair_count = function () {
-          return Math.ceil(enc.chunks / 8) + (enc.chunks > 1 ? 4 : 0);
+          return Math.ceil(enc.chunks / 2) + (enc.chunks > 1 ? 4 : 0);
         };
 
         // The sender loops: every chunk in order, then a batch of repair
@@ -162,7 +193,7 @@ __CODEC__
 
         // Draws one frame as a byte-mode QR code at a whole number of device
         // pixels per module, as large as the window allows.
-        var draw = function (bytes) {
+        var draw_qr = function (bytes) {
           var qr = qrcode(0, "L");
           qr.addData(String.fromCharCode.apply(null, bytes), "Byte");
           qr.make();
@@ -185,10 +216,23 @@ __CODEC__
           }
         };
 
+        // Draws a bundle of frames as a grid code.
+        var draw_grid = function (frames) {
+          grid_paint(AirgapCodec.bundle(frames, AirgapGrid.capacity(grid, colour.checked)),
+                     colour.checked);
+          canvas.getContext("2d").putImageData(grid_image, 0, 0);
+        };
+
         var show = function (p) {
           pos = Math.max(0, p);
-          var id = frame_id(pos);
-          draw(enc.frame(id));
+          var id = frame_id(pos * per_code);
+          if (grid) {
+            var frames = [];
+            for (var i = 0; i < per_code; i++) frames.push(enc.frame(frame_id(pos * per_code + i)));
+            draw_grid(frames);
+          } else {
+            draw_qr(enc.frame(id));
+          }
           user_message.textContent = "Sending \"" + current_name + "\": " +
             (id < enc.chunks ? "chunk " + (id + 1) + " of " + enc.chunks
                              : "repair code for " + enc.chunks + " chunks");
@@ -213,8 +257,44 @@ __CODEC__
           user_message.textContent = "Choose a file or paste text to get started";
         };
 
+        // Sizes the grid picture to the window and splits its capacity into
+        // frames of about GRID_FRAME bytes. Returns the bytes one frame gets.
+        var start_grid = function () {
+          var dpr = window.devicePixelRatio || 1;
+          grid = AirgapGrid.layout(Math.floor((window.innerWidth - 16) * dpr),
+                                   Math.floor((window.innerHeight - 16) * dpr),
+                                   parseInt(cell_size.value, 10));
+          if (!grid) return 0;
+          canvas.width = grid.width;
+          canvas.height = grid.height;
+          canvas.style.width = (grid.width / dpr) + "px";
+          canvas.style.height = (grid.height / dpr) + "px";
+          grid_image = canvas.getContext("2d").createImageData(grid.width, grid.height);
+          grid_paint = AirgapGrid.painter(grid, grid_image.data);
+          var capacity = AirgapGrid.capacity(grid, colour.checked);
+          return Math.floor(capacity / Math.max(1, Math.round(capacity / GRID_FRAME))) - 4;
+        };
+
         var start_encoder = function () {
-          enc = AirgapCodec.encoder(blob, parseInt(density.value, 10));
+          var frame_bytes = parseInt(density.value, 10);
+          grid = null;
+          per_code = 1;
+          if (kind.value === "grid") {
+            frame_bytes = start_grid();
+            if (frame_bytes < 32) {
+              grid = null;
+              user_message.textContent = "Window too small for a grid code";
+              return false;
+            }
+          }
+          enc = AirgapCodec.encoder(blob, frame_bytes);
+          if (grid) {
+            // a small file's frames are shorter, so more of them fit
+            per_code = Math.min(
+              Math.floor(AirgapGrid.capacity(grid, colour.checked) / (enc.frame_size + 4)),
+              enc.chunks + repair_count());
+            if (canvas.scrollIntoView) canvas.scrollIntoView();
+          }
           if (enc.chunks > AirgapCodec.MAX_CHUNKS) {
             user_message.textContent = "File needs too many codes, pick a larger code size";
             return false;
@@ -263,12 +343,14 @@ __CODEC__
         btn_prev.addEventListener("click", function () { show(pos - 1); schedule(); });
         btn_next.addEventListener("click", function () { show(pos + 1); schedule(); });
         speed.addEventListener("change", schedule);
-        // A new code size is a new transfer as far as the receiver is concerned.
-        density.addEventListener("change", function () {
-          if (!is_transferring) return;
-          if (!start_encoder()) { stop_transfer(); return; }
-          show(0);
-          schedule();
+        // A new code type or size is a new transfer as far as the receiver is concerned.
+        [density, kind, cell_size, colour].forEach(function (control) {
+          control.addEventListener("change", function () {
+            if (!is_transferring) return;
+            if (!start_encoder()) { stop_transfer(); return; }
+            show(0);
+            schedule();
+          });
         });
 
         if ("serviceWorker" in navigator) {

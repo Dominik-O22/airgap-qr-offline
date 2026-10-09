@@ -132,9 +132,16 @@ export function loadPage(file) {
     jsQR: () => {
       if (!feed.length) return null;
       const payload = feed.shift();
+      // a located code, so the scanner tracks it instead of searching again
+      const at = (x, y) => ({ x, y });
+      const found = {
+        version: 1,
+        location: { topLeftCorner: at(8, 8), topRightCorner: at(56, 8),
+                    bottomLeftCorner: at(8, 56), bottomRightCorner: at(56, 56) },
+      };
       return typeof payload === "string"
-        ? { data: payload, binaryData: Array.from(Buffer.from(payload)) }
-        : { data: "", binaryData: Array.from(payload) };
+        ? { ...found, data: payload, binaryData: Array.from(Buffer.from(payload)) }
+        : { ...found, data: "", binaryData: Array.from(payload) };
     },
     Blob: FakeBlob,
     URL: { createObjectURL: () => "blob:test", revokeObjectURL() {} },
@@ -234,4 +241,16 @@ export function chunkFrames(blob, chunkSize = SMALL_CODE - HEADER) {
                         chunkSize: c, frameId: i, data }));
   }
   return frames;
+}
+
+// ---- the shared libraries on their own, without a page ----
+
+// Loads pako, codec.js and grid.js into a sandbox and returns their globals.
+export function loadLibs() {
+  const ctx = vm.createContext({ TextEncoder, TextDecoder });
+  for (const file of ["offline/vendor/pako.min.js", "offline/templates/codec.js",
+                      "offline/templates/grid.js"]) {
+    vm.runInContext(readFileSync(path.join(ROOT, file), "utf8"), ctx, { filename: file });
+  }
+  return vm.runInContext("({ AirgapCodec, AirgapGrid })", ctx);
 }

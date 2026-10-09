@@ -10159,6 +10159,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 // frame: the XOR of a pseudo-random subset of chunks derived from its id.
 // The receiver solves for lost chunks by Gaussian elimination, so any K
 // linearly independent frames rebuild the blob, whichever ones were missed.
+//
+// A QR code carries one frame and relies on QR's own error correction. A grid
+// code (grid.js) has none and carries several frames at once, as a bundle:
+// each frame followed by its CRC32, back to back, so damage to one part of
+// the picture only costs the frames it touches.
 var AirgapCodec = (function () {
   var MAGIC = 0xa9;
   var HEADER = 15;
@@ -10193,6 +10198,53 @@ var AirgapCodec = (function () {
   var xor = function (dst, src, offset) {
     var n = Math.min(dst.length, src.length - offset);
     for (var i = 0; i < n; i++) dst[i] ^= src[offset + i];
+  };
+
+  var CRC_TABLE = (function () {
+    var table = new Uint32Array(256);
+    for (var n = 0; n < 256; n++) {
+      var c = n;
+      for (var k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c;
+    }
+    return table;
+  })();
+
+  var crc32 = function (bytes, start, end) {
+    var c = 0xffffffff;
+    for (var i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+
+  // Sender: packs frames of one size into `capacity` bytes for a grid code.
+  var bundle = function (frames, capacity) {
+    var out = new Uint8Array(capacity), view = new DataView(out.buffer), o = 0;
+    frames.forEach(function (f) {
+      out.set(f, o);
+      view.setUint32(o + f.length, crc32(f, 0, f.length));
+      o += f.length + 4;
+    });
+    return out;
+  };
+
+  // Receiver: the frames of a bundle whose checksums hold. The frame size
+  // comes from the first frame's header; if that frame is damaged,
+  // `known_size` (returned as `size` by an earlier call) is used instead.
+  var unbundle = function (bytes, known_size) {
+    var view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    var intact = function (o, size) {
+      return size > HEADER && o + size + 4 <= bytes.length && bytes[o] === MAGIC &&
+             crc32(bytes, o, o + size) === view.getUint32(o + size);
+    };
+    var size = bytes.length >= HEADER ? HEADER + view.getUint16(9) : 0;
+    if (!intact(0, size)) size = known_size;
+    var frames = [];
+    if (size) {
+      for (var o = 0; o + size + 4 <= bytes.length; o += size + 4) {
+        if (intact(o, size)) frames.push(bytes.subarray(o, o + size));
+      }
+    }
+    return { frames: frames, size: frames.length ? size : 0 };
   };
 
   // Sender: builds the blob for a named file.
@@ -10233,6 +10285,7 @@ var AirgapCodec = (function () {
       .getUint32(blob.length - 8);
     return {
       chunks: k,
+      frame_size: HEADER + c,
       frame: function (frame_id) {
         var out = new Uint8Array(HEADER + c);
         var view = new DataView(out.buffer);
@@ -10352,7 +10405,264 @@ var AirgapCodec = (function () {
   };
 
   return { MAX_SIZE: MAX_SIZE, MAX_CHUNKS: MAX_CHUNKS,
-           pack: pack, unpack: unpack, encoder: encoder, parse: parse, decoder: decoder };
+           pack: pack, unpack: unpack, encoder: encoder, parse: parse, decoder: decoder,
+           bundle: bundle, unbundle: unbundle };
+})();
+
+    </script>
+    <script>
+// Grid code: a denser alternative to QR for flat, sharp captures (a window
+// or screen capture, not a hand-held camera). It has no error correction and
+// no perspective handling; the caller checksums what it reads.
+//
+// Layout, from the outside in, where b is the border thickness:
+//
+//   2b  white quiet zone
+//    b  black border
+//    b  white gap
+//    b  timing track along the top and left: one black/white mark per
+//       column or row, black first, always an odd count so it ends on black
+//       data cells, `cell` pixels square, cols x rows
+//    b  white gap, then the border and quiet zone again (right and bottom)
+//
+// The border locates the code, the timing tracks give the number of columns
+// and rows and where they sit, and each data cell is read at its centre.
+// A cell holds 1 bit (black = 1) or, in colour, 3 bits (one per RGB channel,
+// channel off = 1). Bits fill cells row by row, most significant bit first.
+var AirgapGrid = (function () {
+  // Picture geometry for the largest grid of `cell`-pixel cells that fits in
+  // width x height pixels, or null if there is no room for one.
+  var layout = function (width, height, cell) {
+    var b = cell * Math.max(2, Math.ceil(12 / cell));
+    var odd = function (n) { return n % 2 ? n : n - 1; };
+    var cols = odd(Math.floor((width - 9 * b) / cell));
+    var rows = odd(Math.floor((height - 9 * b) / cell));
+    if (cols < 9 || rows < 9) return null;
+    return { cell: cell, b: b, cols: cols, rows: rows,
+             width: cols * cell + 9 * b, height: rows * cell + 9 * b };
+  };
+
+  // Bytes one picture holds.
+  var capacity = function (lay, colour) {
+    return Math.floor(lay.cols * lay.rows * (colour ? 3 : 1) / 8);
+  };
+
+  // Sender: prepares `pixels` (RGBA, lay.width x lay.height) with the fixed
+  // parts of the picture and returns draw(bytes, colour), which paints the
+  // data cells.
+  var painter = function (lay, pixels) {
+    var px = new Uint32Array(pixels.buffer, pixels.byteOffset, lay.width * lay.height);
+    var BLACK = 0xff000000, WHITE = 0xffffffff; // little-endian ABGR
+    var b = lay.b, cell = lay.cell, w = lay.width, h = lay.height;
+    var rect = function (x, y, rw, rh, colour) {
+      for (var j = y; j < y + rh; j++) px.fill(colour, j * w + x, j * w + x + rw);
+    };
+    rect(0, 0, w, h, WHITE);
+    rect(2 * b, 2 * b, w - 4 * b, h - 4 * b, BLACK);
+    rect(3 * b, 3 * b, w - 6 * b, h - 6 * b, WHITE);
+    for (var c = 0; c < lay.cols; c += 2) rect(5 * b + c * cell, 4 * b, cell, b, BLACK);
+    for (var r = 0; r < lay.rows; r += 2) rect(4 * b, 5 * b + r * cell, b, cell, BLACK);
+
+    return function (bytes, colour) {
+      var bit = function (i) { return (bytes[i >> 3] >> (7 - (i & 7))) & 1; };
+      for (var row = 0; row < lay.rows; row++) {
+        var line = (5 * b + row * cell) * w + 5 * b;
+        for (var col = 0; col < lay.cols; col++) {
+          var i = row * lay.cols + col, value;
+          if (colour) {
+            value = 0xff000000 | (bit(3 * i) ? 0 : 0xff) | (bit(3 * i + 1) ? 0 : 0xff00) |
+                    (bit(3 * i + 2) ? 0 : 0xff0000);
+          } else {
+            value = bit(i) ? BLACK : WHITE;
+          }
+          px.fill(value >>> 0, line + col * cell, line + (col + 1) * cell);
+        }
+        // the cell row's other scanlines are copies of its first
+        for (var k = 1; k < cell; k++) {
+          px.copyWithin(line + k * w, line, line + lay.cols * cell);
+        }
+      }
+    };
+  };
+
+  var MID = 128; // luminance below this is dark
+
+  var luma = function (image, x, y) {
+    var o = (y * image.width + x) * 4;
+    return (image.data[o] + 2 * image.data[o + 1] + image.data[o + 2]) >> 2;
+  };
+
+  // Walks from `from` to `to` along a row (fixed = y) or column (fixed = x)
+  // and returns the positions where the picture crosses between light and
+  // dark, each interpolated to a fraction of a pixel. Pixel i spans
+  // [i, i + 1), so its sample sits at i + 0.5.
+  var crossings = function (image, horizontal, fixed, from, to) {
+    var size = horizontal ? image.width : image.height;
+    var limit = horizontal ? image.height : image.width;
+    var step = to >= from ? 1 : -1, out = [];
+    fixed = Math.max(0, Math.min(limit - 1, Math.round(fixed)));
+    from = Math.max(0, Math.min(size - 1, Math.round(from)));
+    to = Math.max(0, Math.min(size - 1, Math.round(to)));
+    var at = function (i) { return horizontal ? luma(image, i, fixed) : luma(image, fixed, i); };
+    var prev = at(from);
+    for (var i = from + step; step > 0 ? i <= to : i >= to; i += step) {
+      var cur = at(i);
+      if ((prev < MID) !== (cur < MID)) {
+        out.push(i - step + 0.5 + step * (prev - MID) / (prev - cur));
+      }
+      prev = cur;
+    }
+    return out;
+  };
+
+  var median = function (values) {
+    var v = values.slice().sort(function (a, b) { return a - b; });
+    return v[v.length >> 1];
+  };
+
+  // Bounding boxes of dark shapes that look like the border: a ring whose
+  // four sides are dark along nearly their whole length. Works on a coarse
+  // point-sampled copy of the image; boxes are returned in image pixels,
+  // largest first.
+  var find_rings = function (image) {
+    var s = Math.max(1, Math.round(Math.max(image.width, image.height) / 720));
+    var w = Math.floor(image.width / s), h = Math.floor(image.height / s);
+    var label = new Int32Array(w * h); // 0 = unvisited dark, -1 = light, >0 = shape id
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (luma(image, x * s + (s >> 1), y * s + (s >> 1)) >= MID) label[y * w + x] = -1;
+      }
+    }
+    var stack = new Int32Array(w * h), rings = [], next = 0;
+    for (var start = 0; start < w * h; start++) {
+      if (label[start] !== 0) continue;
+      var id = ++next, top = 0;
+      var x0 = w, y0 = h, x1 = 0, y1 = 0;
+      stack[top++] = start;
+      label[start] = id;
+      while (top) {
+        var p = stack[--top], px = p % w, py = (p - px) / w;
+        if (px < x0) x0 = px;
+        if (px > x1) x1 = px;
+        if (py < y0) y0 = py;
+        if (py > y1) y1 = py;
+        if (px > 0 && label[p - 1] === 0) { label[p - 1] = id; stack[top++] = p - 1; }
+        if (px < w - 1 && label[p + 1] === 0) { label[p + 1] = id; stack[top++] = p + 1; }
+        if (py > 0 && label[p - w] === 0) { label[p - w] = id; stack[top++] = p - w; }
+        if (py < h - 1 && label[p + w] === 0) { label[p + w] = id; stack[top++] = p + w; }
+      }
+      var bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+      if (bw < 30 || bh < 30) continue;
+      var horizontal = 0, vertical = 0, i;
+      for (i = x0; i <= x1; i++) {
+        horizontal += (label[y0 * w + i] === id) + (label[y1 * w + i] === id);
+      }
+      for (i = y0; i <= y1; i++) {
+        vertical += (label[i * w + x0] === id) + (label[i * w + x1] === id);
+      }
+      if (horizontal < 1.8 * bw || vertical < 1.8 * bh) continue;
+      rings.push({ x0: x0 * s, y0: y0 * s, x1: (x1 + 1) * s, y1: (y1 + 1) * s, area: bw * bh });
+    }
+    return rings.sort(function (a, b) { return b.area - a.area; });
+  };
+
+  // Reads one timing track: `along` is the row or column through its middle,
+  // `from`..`to` spans it with some white on either side. Returns the first
+  // edge, the mark pitch and the mark count, or null if it is not a clean
+  // odd run of evenly sized marks.
+  var read_track = function (image, horizontal, along, from, to) {
+    var edges = crossings(image, horizontal, along, from, to);
+    var count = edges.length - 1;
+    if (count < 9 || count % 2 === 0) return null;
+    var pitch = (edges[count] - edges[0]) / count;
+    for (var i = 0; i < count; i++) {
+      var run = edges[i + 1] - edges[i];
+      if (run < pitch * 0.4 || run > pitch * 1.6) return null;
+    }
+    return { start: edges[0], pitch: pitch, count: count };
+  };
+
+  // Measures one candidate border: its exact outer edges, its thickness, and
+  // from those the two timing tracks.
+  var measure = function (image, ring) {
+    var slack = Math.max(4, Math.round(Math.max(image.width, image.height) / 240));
+    var w = ring.x1 - ring.x0, h = ring.y1 - ring.y0;
+    var fractions = [0.3, 0.5, 0.7];
+    // first crossing when walking inwards from just outside each side
+    var outer = function (horizontal, from, to, span_start, span) {
+      var found = [];
+      fractions.forEach(function (f) {
+        var e = crossings(image, horizontal, span_start + span * f, from, to);
+        if (e.length) found.push(e[0]);
+      });
+      return found.length ? median(found) : NaN;
+    };
+    var left = outer(true, ring.x0 - slack, ring.x0 + slack, ring.y0, h);
+    var right = outer(true, ring.x1 + slack, ring.x1 - slack, ring.y0, h);
+    var top = outer(false, ring.y0 - slack, ring.y0 + slack, ring.x0, w);
+    var bottom = outer(false, ring.y1 + slack, ring.y1 - slack, ring.x0, w);
+    if (!(right - left > 20) || !(bottom - top > 20)) return null;
+
+    // thickness: second crossing when walking inwards through each side
+    var cx = (left + right) / 2, cy = (top + bottom) / 2, thick = [];
+    [[true, cy, left - slack, cx], [true, cy, right + slack, cx],
+     [false, cx, top - slack, cy], [false, cx, bottom + slack, cy]].forEach(function (a) {
+      var e = crossings(image, a[0], a[1], a[2], a[3]);
+      if (e.length >= 2) thick.push(Math.abs(e[1] - e[0]));
+    });
+    if (thick.length < 3) return null;
+    var b = median(thick);
+    if (b < 3) return null;
+
+    // each track sits 2b..3b inside the border; scan from mid-gap to mid-gap
+    var cols = read_track(image, true, top + 2.5 * b, left + 2.5 * b, right - 1.5 * b);
+    var rows = read_track(image, false, left + 2.5 * b, top + 2.5 * b, bottom - 1.5 * b);
+    if (!cols || !rows) return null;
+    return { x: cols.start, y: rows.start, cw: cols.pitch, ch: rows.pitch,
+             cols: cols.count, rows: rows.count,
+             box: { x: Math.floor(left), y: Math.floor(top),
+                    w: Math.ceil(right) - Math.floor(left), h: Math.ceil(bottom) - Math.floor(top) } };
+  };
+
+  // Receiver: finds a grid code in an RGBA image ({ data, width, height }).
+  // Returns its geometry in image pixels, or null.
+  var locate = function (image) {
+    var rings = find_rings(image);
+    for (var i = 0; i < rings.length && i < 8; i++) {
+      var found = measure(image, rings[i]);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  // Receiver: reads the data cells of a located grid. `image` may be a crop
+  // of the picture `geometry` was measured in, with its top left corner at
+  // (offset_x, offset_y) there.
+  var read = function (image, geometry, offset_x, offset_y, colour) {
+    var g = geometry, bits = colour ? 3 : 1;
+    var out = new Uint8Array(Math.floor(g.cols * g.rows * bits / 8));
+    var total = out.length * 8, i = 0;
+    for (var row = 0; row < g.rows && i < total; row++) {
+      var y = Math.floor(g.y + (row + 0.5) * g.ch - offset_y);
+      for (var col = 0; col < g.cols && i < total; col++) {
+        var x = Math.floor(g.x + (col + 0.5) * g.cw - offset_x);
+        var o = (y * image.width + x) * 4;
+        if (colour) {
+          for (var ch = 0; ch < 3 && i < total; ch++, i++) {
+            if (image.data[o + ch] < MID) out[i >> 3] |= 0x80 >> (i & 7);
+          }
+        } else {
+          if (((image.data[o] + 2 * image.data[o + 1] + image.data[o + 2]) >> 2) < MID) {
+            out[i >> 3] |= 0x80 >> (i & 7);
+          }
+          i++;
+        }
+      }
+    }
+    return out;
+  };
+
+  return { layout: layout, capacity: capacity, painter: painter, locate: locate, read: read };
 })();
 
     </script>
@@ -10388,10 +10698,19 @@ var AirgapCodec = (function () {
         var ROI_MAX_ZOOM = 4;
         var ROI_MIN_ZOOM = 0.25;
         var ROI_MAX_MISSES = 8;     // unreadable frames before searching the whole frame again
-        // Whole-frame searches alternate between these scales, since a dense
+        // Whole-frame searches rotate through a grid code search, which is
+        // quick, and then a QR search at each of these scales, since a dense
         // code can be too fine to read (and so to locate) at camera resolution.
         var SEARCH_ZOOMS = [1, 2];
         var SEARCH_MAX_WIDTH = 2560;
+
+        // Geometry of the grid code being read, in video pixels, or null. A
+        // grid sits still on a screen, so it is located once and then only
+        // sampled, until it stops yielding frames.
+        var grid = null, grid_misses = 0;
+        // What worked on the last picture: colour or not, the frame size, and
+        // the picture's first frame (a picture spans several video frames).
+        var grid_colour = false, grid_frame_size = 0, grid_last = "";
 
         var safe_filename = function (name) {
           var n = String(name || "").split(/[\\/]/).pop();
@@ -10438,6 +10757,7 @@ var AirgapCodec = (function () {
           video.srcObject = null;
           camera.hidden = true;
           roi = null;
+          grid = null;
           stats.textContent = "";
         };
 
@@ -10461,30 +10781,75 @@ var AirgapCodec = (function () {
                    zoom: Math.min(ROI_MAX_ZOOM, Math.max(ROI_MIN_ZOOM, ROI_MODULE_PX * modules / side)) };
         };
 
-        // Decodes the current video frame and returns the QR code's bytes, or
-        // null. With a tracked region only that part is decoded, scaled so
-        // small or dense codes still have several pixels per module.
-        var decode_frame = function () {
-          var src = roi || { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
-          var zoom = roi ? roi.zoom
-            : Math.min(SEARCH_ZOOMS[searches++ % SEARCH_ZOOMS.length], SEARCH_MAX_WIDTH / src.w);
+        // Copies a region of the current video frame, scaled by `zoom`, to
+        // the scan canvas and returns its pixels.
+        var grab = function (src, zoom) {
           scan.width = Math.round(src.w * zoom);
           scan.height = Math.round(src.h * zoom);
           var ctx = scan.getContext("2d", { willReadFrequently: true });
           ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, scan.width, scan.height);
-          var image = ctx.getImageData(0, 0, scan.width, scan.height);
-          var started = Date.now();
-          var code = jsQR(image.data, scan.width, scan.height, { inversionAttempts: "dontInvert" });
+          return ctx.getImageData(0, 0, scan.width, scan.height);
+        };
+
+        var show_stats = function (what, started) {
           stats.textContent = "Video " + video.videoWidth + "x" + video.videoHeight +
-            (roi ? ", tracking code at " : ", searching whole frame at ") + zoom.toFixed(1) + "x" +
-            ", decode " + (Date.now() - started) + "ms";
+            ", " + what + ", decode " + (Date.now() - started) + "ms";
+        };
+
+        // Reads the located grid code and returns the frames in it whose
+        // checksums hold. Tries the mode that worked last time first.
+        var read_grid = function () {
+          var started = Date.now();
+          var image = grab(grid.box, 1), found = null;
+          [grid_colour, !grid_colour].some(function (colour) {
+            var bytes = AirgapGrid.read(image, grid, grid.box.x, grid.box.y, colour);
+            var result = AirgapCodec.unbundle(bytes, grid_frame_size);
+            if (!result.frames.length) return false;
+            grid_colour = colour;
+            grid_frame_size = result.size;
+            found = result.frames;
+            return true;
+          });
+          show_stats("grid " + grid.cols + "x" + grid.rows + (grid_colour ? " colour" : "") +
+                     ", " + (found ? found.length : 0) + " frames read", started);
+          if (!found) {
+            if (++grid_misses >= ROI_MAX_MISSES) { grid = null; grid_frame_size = 0; }
+            return [];
+          }
+          grid_misses = 0;
+          var first = Array.prototype.join.call(found[0].subarray(0, 15));
+          if (first === grid_last) return [];
+          grid_last = first;
+          return found;
+        };
+
+        // Decodes the current video frame and returns the frames found in it.
+        // With a tracked QR region only that part is decoded, scaled so small
+        // or dense codes still have several pixels per module.
+        var decode_frame = function () {
+          if (grid) return read_grid();
+          var whole = { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
+          var started = Date.now();
+          var step = roi ? 0 : searches++ % (SEARCH_ZOOMS.length + 1);
+          if (!roi && step === 0) {
+            grid = AirgapGrid.locate(grab(whole, 1));
+            grid_misses = 0;
+            show_stats("searching whole frame for a grid", started);
+            return grid ? read_grid() : [];
+          }
+          var src = roi || whole;
+          var zoom = roi ? roi.zoom : Math.min(SEARCH_ZOOMS[step - 1], SEARCH_MAX_WIDTH / src.w);
+          var image = grab(src, zoom);
+          var code = jsQR(image.data, scan.width, scan.height, { inversionAttempts: "dontInvert" });
+          show_stats((roi ? "tracking QR code at " : "searching whole frame at ") +
+                     zoom.toFixed(1) + "x", started);
           if (!code) {
             if (roi && ++roi_misses >= ROI_MAX_MISSES) roi = null;
-            return null;
+            return [];
           }
           roi_misses = 0;
           if (code.location) roi = region_around(code, src, zoom);
-          return code.binaryData;
+          return [code.binaryData];
         };
 
         var complete = function () {
@@ -10533,8 +10898,7 @@ var AirgapCodec = (function () {
           if (!is_receiving) return;
           try {
             if (video.videoWidth > 0 && video.videoHeight > 0) {
-              var bytes = decode_frame();
-              if (bytes) accept(bytes);
+              decode_frame().forEach(accept);
               if (decoder && decoder.rank() >= decoder.chunks) {
                 complete();
                 return;

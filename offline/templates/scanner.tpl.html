@@ -41,6 +41,9 @@ __JSQR__
 __CODEC__
     </script>
     <script>
+__GRID__
+    </script>
+    <script>
       (function () {
         var user_message = document.getElementById("user_message");
         var progress = document.getElementById("progress");
@@ -72,10 +75,19 @@ __CODEC__
         var ROI_MAX_ZOOM = 4;
         var ROI_MIN_ZOOM = 0.25;
         var ROI_MAX_MISSES = 8;     // unreadable frames before searching the whole frame again
-        // Whole-frame searches alternate between these scales, since a dense
+        // Whole-frame searches rotate through a grid code search, which is
+        // quick, and then a QR search at each of these scales, since a dense
         // code can be too fine to read (and so to locate) at camera resolution.
         var SEARCH_ZOOMS = [1, 2];
         var SEARCH_MAX_WIDTH = 2560;
+
+        // Geometry of the grid code being read, in video pixels, or null. A
+        // grid sits still on a screen, so it is located once and then only
+        // sampled, until it stops yielding frames.
+        var grid = null, grid_misses = 0;
+        // What worked on the last picture: colour or not, the frame size, and
+        // the picture's first frame (a picture spans several video frames).
+        var grid_colour = false, grid_frame_size = 0, grid_last = "";
 
         var safe_filename = function (name) {
           var n = String(name || "").split(/[\\/]/).pop();
@@ -122,6 +134,7 @@ __CODEC__
           video.srcObject = null;
           camera.hidden = true;
           roi = null;
+          grid = null;
           stats.textContent = "";
         };
 
@@ -145,30 +158,75 @@ __CODEC__
                    zoom: Math.min(ROI_MAX_ZOOM, Math.max(ROI_MIN_ZOOM, ROI_MODULE_PX * modules / side)) };
         };
 
-        // Decodes the current video frame and returns the QR code's bytes, or
-        // null. With a tracked region only that part is decoded, scaled so
-        // small or dense codes still have several pixels per module.
-        var decode_frame = function () {
-          var src = roi || { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
-          var zoom = roi ? roi.zoom
-            : Math.min(SEARCH_ZOOMS[searches++ % SEARCH_ZOOMS.length], SEARCH_MAX_WIDTH / src.w);
+        // Copies a region of the current video frame, scaled by `zoom`, to
+        // the scan canvas and returns its pixels.
+        var grab = function (src, zoom) {
           scan.width = Math.round(src.w * zoom);
           scan.height = Math.round(src.h * zoom);
           var ctx = scan.getContext("2d", { willReadFrequently: true });
           ctx.drawImage(video, src.x, src.y, src.w, src.h, 0, 0, scan.width, scan.height);
-          var image = ctx.getImageData(0, 0, scan.width, scan.height);
-          var started = Date.now();
-          var code = jsQR(image.data, scan.width, scan.height, { inversionAttempts: "dontInvert" });
+          return ctx.getImageData(0, 0, scan.width, scan.height);
+        };
+
+        var show_stats = function (what, started) {
           stats.textContent = "Video " + video.videoWidth + "x" + video.videoHeight +
-            (roi ? ", tracking code at " : ", searching whole frame at ") + zoom.toFixed(1) + "x" +
-            ", decode " + (Date.now() - started) + "ms";
+            ", " + what + ", decode " + (Date.now() - started) + "ms";
+        };
+
+        // Reads the located grid code and returns the frames in it whose
+        // checksums hold. Tries the mode that worked last time first.
+        var read_grid = function () {
+          var started = Date.now();
+          var image = grab(grid.box, 1), found = null;
+          [grid_colour, !grid_colour].some(function (colour) {
+            var bytes = AirgapGrid.read(image, grid, grid.box.x, grid.box.y, colour);
+            var result = AirgapCodec.unbundle(bytes, grid_frame_size);
+            if (!result.frames.length) return false;
+            grid_colour = colour;
+            grid_frame_size = result.size;
+            found = result.frames;
+            return true;
+          });
+          show_stats("grid " + grid.cols + "x" + grid.rows + (grid_colour ? " colour" : "") +
+                     ", " + (found ? found.length : 0) + " frames read", started);
+          if (!found) {
+            if (++grid_misses >= ROI_MAX_MISSES) { grid = null; grid_frame_size = 0; }
+            return [];
+          }
+          grid_misses = 0;
+          var first = Array.prototype.join.call(found[0].subarray(0, 15));
+          if (first === grid_last) return [];
+          grid_last = first;
+          return found;
+        };
+
+        // Decodes the current video frame and returns the frames found in it.
+        // With a tracked QR region only that part is decoded, scaled so small
+        // or dense codes still have several pixels per module.
+        var decode_frame = function () {
+          if (grid) return read_grid();
+          var whole = { x: 0, y: 0, w: video.videoWidth, h: video.videoHeight };
+          var started = Date.now();
+          var step = roi ? 0 : searches++ % (SEARCH_ZOOMS.length + 1);
+          if (!roi && step === 0) {
+            grid = AirgapGrid.locate(grab(whole, 1));
+            grid_misses = 0;
+            show_stats("searching whole frame for a grid", started);
+            return grid ? read_grid() : [];
+          }
+          var src = roi || whole;
+          var zoom = roi ? roi.zoom : Math.min(SEARCH_ZOOMS[step - 1], SEARCH_MAX_WIDTH / src.w);
+          var image = grab(src, zoom);
+          var code = jsQR(image.data, scan.width, scan.height, { inversionAttempts: "dontInvert" });
+          show_stats((roi ? "tracking QR code at " : "searching whole frame at ") +
+                     zoom.toFixed(1) + "x", started);
           if (!code) {
             if (roi && ++roi_misses >= ROI_MAX_MISSES) roi = null;
-            return null;
+            return [];
           }
           roi_misses = 0;
           if (code.location) roi = region_around(code, src, zoom);
-          return code.binaryData;
+          return [code.binaryData];
         };
 
         var complete = function () {
@@ -217,8 +275,7 @@ __CODEC__
           if (!is_receiving) return;
           try {
             if (video.videoWidth > 0 && video.videoHeight > 0) {
-              var bytes = decode_frame();
-              if (bytes) accept(bytes);
+              decode_frame().forEach(accept);
               if (decoder && decoder.rank() >= decoder.chunks) {
                 complete();
                 return;
